@@ -22,7 +22,7 @@ enable_testing()
 add_executable(disk_kv_store_test tests/disk_kv_store_test.cpp)
 target_link_libraries(disk_kv_store_test PRIVATE diskkv)
 add_test(NAME disk_kv_store_test
-         COMMAND disk_kv_store_test ${CMAKE_BINARY_DIR}/l.bin 1589632 150)
+         COMMAND disk_kv_store_test ${CMAKE_BINARY_DIR}/l.bin 262144 512)
 
 # Bridge round-trip suite: arg1 = output directory for per-family files.
 add_executable(disk_kv_bridge_test tests/disk_kv_bridge_test.cpp)

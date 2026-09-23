@@ -1,82 +1,84 @@
 #pragma once
-// Engine-facing facade over DiskKVStore (the L3 cold tier).
+// Engine-facing facade over DiskKVStore (the L3 disk cold tier).
 //
-// The engine drives this with plain (kind, identity, page_index) keys and host
-// byte spans. It stays engine-type-free on purpose: `identity` is the 128-bit
-// content digest the engine already computes per checkpoint frontier
-// (PrefixShortlistDigests::at), so a page's KV bytes are addressable on disk
-// even after the logical page descriptor (and its content_epoch) has been
-// reclaimed under pressure. That is the whole reason this tier works where a
-// "just hold the host page" tier would silently lose the key.
+// The engine drives this with per-PAGE content identities and host byte
+// spans. One page = one slot in the store.
 //
-//   spill  : host run is about to be freed  -> reserve+write+publish a group
-//   restore: host page is gone, recompute  -> read_page back into a fresh
-//           extent (the engine then runs its normal H2D restore unchanged)
+// Identity model (what makes this tier work):
+//   The engine maintains a rolling 128-bit digest per token frontier
+//   (PrefixShortlistDigests): digest(F) is a pure function of the first F
+//   tokens (with their positions). A KV page covering [p*64, F) is
+//   content-addressed by digest(F) — recomputable at spill time (from the
+//   live sequence) AND at restore time (from the incoming request's own
+//   digest chain) with no persistent metadata. Same content in two sessions
+//   => same digest => the second spill is an idempotent no-op (free dedupe
+//   of shared prefixes).
 //
-// A miss (evicted, corrupt, or never spilt) returns false and the engine falls
-// back to exactly what it does today (full recompute). Strictly better-or-equal.
+//   `tag` disambiguates KV produced for different engine configurations
+//   (speculative backend, proposal head, KV dtype) — identical token
+//   prefixes under a different spec backend produce different KV bytes, so
+//   the tag is part of the key, exactly like the engine's own
+//   CheckpointSummary::shortlist_key identity_tag.
+//
+//   A miss (evicted, corrupt, or never spilt) returns false and the engine
+//   falls back to exactly what it does today (recompute). Strictly
+//   better-or-equal.
+//
+// One family per KV plane: MainKV / BackendKV have different page strides,
+// so each owns its own store file.
 
 #include "diskkv/disk_kv_store.h"
 
+#include <array>
+#include <chrono>
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
-#include <optional>
+#include <mutex>
 #include <span>
 #include <string>
-#include <unordered_map>
+#include <thread>
+#include <vector>
 
 namespace ninfer {
 
-/** One KV plane family. Text and backend KV have different page strides, so
- *  each family owns its own store (and its own page_stride). */
 enum class DiskKVKind : std::uint8_t {
     MainKV      = 0,
     BackendKV   = 1,
-    StateImage  = 2,   // state image bytes, spilt the same way (small groups)
+    StateImage  = 2,  // reserved: state images (GDN recurrent state)
 };
 
-/** 128-bit content identity for one checkpoint frontier + one KV family.
- *  The engine fills this from its prefix shortlist digest (or a per-block
- *  token hash). Must be identical at spill time and restore time. */
-struct DiskKVIdentity {
-    std::uint64_t lo = 0;
-    std::uint64_t hi = 0;
-    std::uint32_t kind = 0;   // DiskKVKind as int (family)
-    std::uint32_t frontier = 0;  // token frontier the checkpoint sits at
-
-    [[nodiscard]] bool operator==(const DiskKVIdentity&) const noexcept = default;
-};
-
-struct DiskKVIdentityHash {
-    [[nodiscard]] std::size_t operator()(const DiskKVIdentity& k) const noexcept {
-        std::size_t h = std::hash<std::uint64_t>{}(k.lo);
-        h ^= std::hash<std::uint64_t>{}(k.hi) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h ^= static_cast<std::size_t>(k.kind) * 0xff51afd7ed558ccdULL;
-        h ^= static_cast<std::size_t>(k.frontier) * 0xc4ceb9fe1a85ec53ULL;
-        return h;
-    }
+/** One queued spill: identity + copied bytes. Engine copies; the bridge's
+ *  worker thread does the disk write (off the engine's hot path). */
+struct SpillJob {
+    DiskKVIdentity id;
+    DiskKVKind kind;
+    std::vector<std::byte> bytes;
 };
 
 struct DiskKVBridgeStats {
-    std::uint64_t spills          = 0;  // groups written to disk
-    std::uint64_t spill_bytes      = 0;
-    std::uint64_t restores         = 0;  // pages read back
-    std::uint64_t restore_bytes    = 0;
-    std::uint64_t restore_misses   = 0;  // fell back to recompute
-    std::uint64_t evicted_groups   = 0;
+    std::uint64_t spills          = 0;
+    std::uint64_t spill_bytes     = 0;
+    std::uint64_t spill_dups      = 0;  // identity already restorable (dedupe hit)
+    std::uint64_t restores        = 0;
+    std::uint64_t restore_bytes   = 0;
+    std::uint64_t restore_misses  = 0;
+    std::uint64_t evicted_slots   = 0;
+    std::uint64_t queue_drops     = 0;  // queue full: page lost (recompute later)
 };
 
 class DiskKVBridge {
 public:
     struct Options {
-        std::string base_path    = "";  // parent dir; bridge appends /<kind>.diskkv
-        std::size_t main_page_stride   = 0;   // from HostKVPageLayout(MainKV)
+        std::string base_path = "";  // parent dir; per-family files <name>.diskkv
+        std::size_t main_page_stride    = 0;  // from HostKVPageLayout(MainKV)
         std::size_t backend_page_stride = 0;  // 0 = family disabled
-        std::size_t state_page_stride  = 0;   // 0 = family disabled
-        std::size_t capacity_bytes     = 0;   // per-family cap; 0 = all of max_pages
-        std::uint32_t max_pages        = 0;   // per-family page budget
-        bool verify_crc        = true;
+        std::size_t state_page_stride   = 0;  // 0 = family disabled
+        // Total spill budget; split across ENABLED families 85/15 (main dominates).
+        std::size_t capacity_bytes = 0;  // 0 = disabled
+        bool verify_crc = true;
     };
 
     /** Open (create) the per-family backing files. Throws on failure. */
@@ -88,29 +90,66 @@ public:
 
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
-    /**
-     * Spill a contiguous host run (page_count consecutive pages, one family) to
-     * disk. Returns true if the run is now restorable (or already was). The
-     * caller's bytes are copied; it may free them after this returns. If there
-     * is no room the bridge evicts LRU cold groups first (never a live one) and
-     * still returns false only if the family truly cannot hold the run.
-     */
-    bool spill(const DiskKVIdentity& id, DiskKVKind kind, std::uint32_t page_count,
-               std::span<const std::byte> bytes);
+    /** Spill one page. The bytes are copied into a bounded queue and written
+     *  by a background thread: the caller only pays one memcpy (host pages
+     *  are released by the engine right after this call, so synchronous disk
+     *  IO would stall the pressure/eviction path for seconds). Returns true
+     *  if the page is queued (or already restorable); false if the family is
+     *  disabled or the queue is full (restore will fall back to recompute). */
+    bool spill_page(const DiskKVIdentity& id, DiskKVKind kind, std::span<const std::byte> bytes);
 
-    /** Read one page of a previously spilt run into `dst` (page_stride bytes).
-     *  Returns false on miss/evict/corrupt -> caller recomputes. */
+    /** Backpressure-aware spill for the owner-death path: waits up to
+     *  `timeout` for a free queue slot instead of dropping the page. A dropped
+     *  page breaks the contiguous prefix chain (restore walks from 0 and stops
+     *  at the first miss), costing a full recompute. Returns true if queued
+     *  (or already restorable); false on timeout / disabled / shutdown. */
+    bool spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
+                         std::span<const std::byte> bytes, std::chrono::milliseconds timeout);
+
+    /** Synchronous spill: write the bytes to the store on the calling thread
+     *  (no async queue copy). For large blobs (state images ~146 MiB) where
+     *  buffering a copy in the bounded queue would exhaust memory. The caller
+     *  must ensure `bytes` outlives this call (it is read directly). Returns
+     *  true if restorable after the call (fresh write or dedupe hit). */
+    bool spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
+                         std::span<const std::byte> bytes);
+
+    /** Wait until all queued spill jobs have been applied. Test/diagnostics. */
+    void wait_idle();
+
+    /** Read one previously spilt page into `dst` (family stride bytes).
+     *  Synchronous (reads on the calling thread; the async queue is spill-only),
+     *  so the read-side restore never waits on the background writer. Returns
+     *  false on miss/evict/corrupt -> caller recomputes. */
     [[nodiscard]] bool restore_page(const DiskKVIdentity& id, DiskKVKind kind,
-                                    std::uint32_t page_index, std::span<std::byte> dst) const;
+                                    std::span<std::byte> dst) const;
 
-    /** True if at least one page of this identity is restorable on disk. Cheap. */
+    /** True if this identity's page is restorable on disk right now. Cheap
+     *  (header check). */
     [[nodiscard]] bool contains(const DiskKVIdentity& id, DiskKVKind kind) const;
+
+    /** Read-only benefit probe: longest contiguous prefix (from page 0) of
+     *  `page_ids` that is restorable now. Admission-time Root-path requests
+     *  use this to measure how much recompute the tier COULD save. */
+    [[nodiscard]] std::size_t probe_prefix(const std::vector<DiskKVIdentity>& page_ids,
+                                           DiskKVKind kind) const;
+
+    /** Append one probe record as a JSONL line next to the disk files. */
+    void record_probe(std::uint32_t prompt_tokens, std::uint32_t restorable_tokens) const;
 
     /** Refresh LRU position after a successful restore. */
     void touch(const DiskKVIdentity& id, DiskKVKind kind);
 
+    /** Frontiers of every live StateImage page (the state image at frontier E
+     *  is keyed digest(E) — the same key as the partial tail KV page at E, so
+     *  a restorable boundary is exactly a live state frontier whose digest the
+     *  incoming request's own chain also produces). Empty when the state family
+     *  is disabled. */
+    [[nodiscard]] std::vector<std::uint32_t> live_state_frontiers() const;
+
     [[nodiscard]] DiskKVBridgeStats stats() const;
     [[nodiscard]] std::size_t used_bytes(DiskKVKind kind) const;
+    [[nodiscard]] std::uint32_t slot_count(DiskKVKind kind) const;
     [[nodiscard]] const std::string& path(DiskKVKind kind) const;
 
 private:
@@ -120,17 +159,29 @@ private:
         std::string path;
     };
 
+    void worker_loop();
+    /** Apply one queued job to the store (worker thread / destructor drain). */
+    void spill_queued(SpillJob& job);
+
     Family& family(DiskKVKind kind);
     const Family& family(DiskKVKind kind) const;
-    [[nodiscard]] std::optional<std::uint32_t>
-    group_for(const DiskKVIdentity& id, DiskKVKind kind, bool for_write) const;
+    [[nodiscard]] static std::uint32_t kind_index(DiskKVKind kind) {
+        return static_cast<std::uint32_t>(kind);
+    }
 
     Options opts_;
     bool    enabled_ = false;
     Family families_[3];
-    mutable std::mutex mu_;   // guards group cache + stats (store is itself locked)
-    mutable std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> group_cache_;
+    mutable std::mutex mu_;   // guards stats (stores are self-locked)
     mutable DiskKVBridgeStats stats_;
+    // Bounded async spill queue + writer thread.
+    std::mutex qmu_;
+    std::condition_variable qcv_;
+    std::deque<SpillJob> queue_;
+    std::thread worker_;
+    bool quit_ = false;
+    std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied
+    static constexpr std::size_t kQueueCap = 512;  // ~780 MiB in flight at 1.5 MiB/page
 };
 
 } // namespace ninfer

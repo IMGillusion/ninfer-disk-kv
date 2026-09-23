@@ -1,16 +1,16 @@
-// Self-test / micro-benchmark for DiskKVStore.
-// Build: g++ -std=c++20 -O2 disk_kv_store_test.cpp disk_kv_store.cpp -o dks_test
-// Run:   ./dks_test <path> [page_stride] [max_pages]
+// Self-test / micro-benchmark for DiskKVStore (identity-keyed, self-describing slots).
+// Build: g++ -std=c++20 -O2 -Iinclude tests/disk_kv_store_test.cpp src/disk_kv_store.cpp -o dks_test -pthread
+// Run:   ./dks_test <path> [slot_stride] [max_slots]
 //
-// Verifies: round-trip integrity, capacity boundary, LRU eviction order,
-// crc corruption detection, persistence across reopen. Benchmarks:
-// write throughput, read (restore) throughput for a large group.
-
+// Verifies: round-trip integrity, dedupe/refresh, capacity boundary + LRU
+// eviction order, CRC corruption rejection, index rebuild from slot scan,
+// persistence across reopen. Benchmarks write/read (restore) throughput.
 #include "diskkv/disk_kv_store.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -22,133 +22,138 @@ static int failures = 0;
     else { std::printf("ok:   %s\n", msg); } \
 } while (0)
 
+static DiskKVIdentity make_id(std::uint64_t seed, std::uint32_t frontier) {
+    return DiskKVIdentity{.lo       = 0x9e3779b97f4a7c15ULL * (seed + 1),
+                          .hi       = 0xbf58476d1ce4e5b9ULL ^ (seed * 0x94d049bb133111ebULL),
+                          .tag      = 0x30101,
+                          .frontier = frontier};
+}
+
 int main(int argc, char** argv) {
-    std::string path = argc > 1 ? argv[1] : "/tmp/dks_test.bin";
-    const std::size_t stride = argc > 2 ? std::stoul(argv[2]) : 1589632; // ~1.51MiB, real page size
-    const std::uint32_t max_pages = argc > 3 ? std::stoul(argv[3]) : 10000;
+    const std::string path   = argc > 1 ? argv[1] : "/tmp/dks_test.bin";
+    const std::size_t stride = argc > 2 ? std::stoul(argv[2]) : 262144;  // 256 KiB
+    const std::uint32_t slots = argc > 3 ? std::stoul(argv[3]) : 64;
 
-    // ---------- 1. round-trip ----------
+    DiskKVStore::Options opts{.path           = path,
+                              .slot_size      = stride,
+                              .capacity_bytes = 0,
+                              .max_slots      = slots,
+                              .verify_crc     = true};
+
+    std::vector<std::byte> page(stride);
+    for (std::size_t i = 0; i < stride; ++i) page[i] = std::byte((i * 31 + 7) & 0xFF);
+
+    // ---------- 1. round-trip + dedupe ----------
     {
-        DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = max_pages});
-        auto g = s.reserve(8);
-        CHECK(g.has_value(), "reserve 8 pages");
-        std::vector<std::byte> buf(8 * stride);
-        for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<std::byte>(i * 31 + 7);
-        CHECK(s.write_group(*g, std::span<const std::byte>(buf.data(), buf.size())), "write_group 8 pages");
-        CHECK(s.publish(*g), "publish group");
-        std::vector<std::byte> out(8 * stride);
-        CHECK(s.read_group(*g, std::span<std::byte>(out.data(), out.size())), "read_group 8 pages");
-        CHECK(std::memcmp(buf.data(), out.data(), buf.size()) == 0, "round-trip bytes identical");
-        auto page0 = s.read_page(*g, 0);
-        CHECK(page0.has_value() && page0->size() == stride, "read_page returns one stride");
-        if (page0) CHECK(std::memcmp(page0->data(), buf.data(), stride) == 0, "page0 identical");
+        std::remove(path.c_str());
+        std::remove((path + ".idx").c_str());
+        DiskKVStore s(opts);
+        const auto id = make_id(1, 64);
+        CHECK(s.upsert_page(id, page, nullptr), "upsert page");
+        CHECK(s.contains(id), "contains after upsert");
+        std::vector<std::byte> out(stride);
+        CHECK(s.read_page(id, out), "read_page");
+        CHECK(std::memcmp(out.data(), page.data(), stride) == 0, "round-trip bytes identical");
+        CHECK(s.upsert_page(id, page, nullptr), "re-upsert same id");
+        CHECK(s.live_slots() == 1, "dedupe: one live slot");
     }
 
-    // ---------- 2. persistence across reopen (the whole point) ----------
+    // ---------- 2. persistence across reopen ----------
     {
-        {
-            DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = max_pages});
-            auto g = s.reserve(4);
-            std::vector<std::byte> buf(4 * stride);
-            for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<std::byte>(i % 251);
-            s.write_group(*g, std::span<const std::byte>(buf.data(), buf.size()));
-            s.publish(*g);
-            std::printf("persisted group id=%u into %s\n", *g, path.c_str());
-            // store goes away here (simulating process exit)
+        DiskKVStore s(opts);
+        const auto id = make_id(1, 64);
+        CHECK(s.contains(id), "persisted page found after reopen");
+        std::vector<std::byte> out(stride);
+        CHECK(s.read_page(id, out) && std::memcmp(out.data(), page.data(), stride) == 0,
+              "persisted bytes identical");
+        CHECK(!s.index_rebuilt_from_scan(), "fast index path (no scan)");
+    }
+
+    // ---------- 3. LRU eviction order ----------
+    {
+        DiskKVStore::Options small = opts;
+        small.path      = path + ".lru";
+        small.max_slots = 3;
+        std::remove(small.path.c_str());
+        std::remove((small.path + ".idx").c_str());
+        DiskKVStore s(small);
+        const auto a = make_id(10, 64), b = make_id(11, 64), c = make_id(12, 64), d = make_id(13, 64);
+        CHECK(s.upsert_page(a, page, nullptr), "lru: insert a");
+        CHECK(s.upsert_page(b, page, nullptr), "lru: insert b");
+        CHECK(s.upsert_page(c, page, nullptr), "lru: insert c");
+        CHECK(s.touch(a), "lru: touch a (most recent)");
+        std::vector<std::uint32_t> evicted;
+        CHECK(s.upsert_page(d, page, &evicted), "lru: insert d (must evict)");
+        CHECK(!s.contains(b), "lru: b (least recent) evicted");
+        CHECK(s.contains(a) && s.contains(c) && s.contains(d), "lru: a/c/d present");
+        CHECK(!s.upsert_page(make_id(99, 64), page, nullptr) || s.live_slots() == 3,
+              "capacity never exceeded");
+    }
+
+    // ---------- 4. CRC corruption rejection ----------
+    {
+        DiskKVStore::Options crc = opts;
+        crc.path = path + ".crc";
+        std::remove(crc.path.c_str());
+        std::remove((crc.path + ".idx").c_str());
+        DiskKVStore s(crc);
+        const auto id = make_id(20, 64);
+        CHECK(s.upsert_page(id, page, nullptr), "crc: upsert");
+        s.flush_index();
+        // locate the payload in the data file and corrupt one byte inside it
+        std::fstream f(crc.path, std::ios::in | std::ios::out | std::ios::binary);
+        std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const std::string needle(reinterpret_cast<const char*>(page.data()), 64);
+        const auto pos = data.find(needle);
+        CHECK(pos != std::string::npos, "crc: payload pattern found in data file");
+        if (pos != std::string::npos) {
+            data[pos + 100] ^= 0x5A;
+            f.seekp(0);
+            f.write(data.data(), static_cast<std::streamsize>(data.size()));
+            f.flush();
         }
-        {
-            DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = max_pages});
-            // NOTE: reopening truncates the file (O_TRUNC) — a fresh store is empty.
-            // The real engine keeps ONE store process-wide; reopen-truncate is the
-            // documented crash-recovery semantic (disk tier is best-effort, not a
-            // WAL). Verify empty-after-reopen is the actual behavior, not corruption.
-            CHECK(s.used_pages() == 0, "fresh open starts empty (best-effort tier)");
+        std::vector<std::byte> out(stride);
+        CHECK(!s.read_page(id, out), "crc: corrupted payload rejected");
+    }
+
+    // ---------- 5. index rebuild from scan ----------
+    {
+        std::remove((path + ".idx").c_str());
+        DiskKVStore s(opts);
+        CHECK(s.index_rebuilt_from_scan(), "index rebuilt from slot scan");
+        CHECK(s.contains(make_id(1, 64)), "data intact after rebuild");
+    }
+
+    // ---------- 6. write / read benchmark ----------
+    {
+        DiskKVStore::Options bench = opts;
+        bench.path      = path + ".bench";
+        const std::uint32_t n = std::min<std::uint32_t>(2000, std::max<std::uint32_t>(64, slots));
+        bench.max_slots = n + 8;
+        std::remove(bench.path.c_str());
+        std::remove((bench.path + ".idx").c_str());
+        DiskKVStore s(bench);
+        std::vector<std::byte> out(stride);
+        const auto t0 = std::chrono::steady_clock::now();
+        std::uint32_t written = 0;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (s.upsert_page(make_id(1000 + i, 64), page, nullptr)) { ++written; }
         }
-    }
-
-    // ---------- 3. capacity boundary ----------
-    {
-        const std::uint32_t small = 100;
-        DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = small});
-        std::vector<std::byte> buf(50 * stride);
-        std::vector<std::uint32_t> ids;
-        for (int i = 0; i < 2; ++i) { // 50+50 = 100 = capacity
-            auto g = s.reserve(50);
-            if (g) { s.write_group(*g, std::span<const std::byte>(buf.data(), buf.size())); s.publish(*g); s.release(*g); ids.push_back(*g); }
+        s.flush_index();
+        const auto t1 = std::chrono::steady_clock::now();
+        std::uint32_t read = 0;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (s.read_page(make_id(1000 + i, 64), out)) { ++read; }
         }
-        CHECK(ids.size() == 2, "two 50-page groups fill capacity");
-        CHECK(!s.reserve(1).has_value(), "capacity full -> reserve fails");
-        CHECK(s.evict_until_free(60).size() >= 1, "evict_until_free frees space");
-        CHECK(s.reserve(50).has_value(), "after eviction reserve succeeds again");
+        const auto t2 = std::chrono::steady_clock::now();
+        const double wsec = std::chrono::duration<double>(t1 - t0).count();
+        const double rsec = std::chrono::duration<double>(t2 - t1).count();
+        const double mb   = static_cast<double>(n) * static_cast<double>(stride) / (1024.0 * 1024.0);
+        std::printf("bench: %u pages x %zu B | write %.0f MB/s (%u) | read %.0f MB/s (%u)\n", n,
+                    stride, mb / wsec, written, mb / rsec, read);
+        CHECK(written == n && read == n, "bench: all pages written and read back");
     }
 
-    // ---------- 4. LRU order ----------
-    {
-        DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = 6});
-        std::vector<std::byte> buf(2 * stride);
-        std::uint32_t a = *s.reserve(2), b = *s.reserve(2), c = *s.reserve(2);
-        auto fill = [&](std::uint32_t id) {
-            s.write_group(id, std::span<const std::byte>(buf.data(), buf.size()));
-            s.publish(id); s.release(id);
-        };
-        fill(a); fill(b); fill(c);
-        // touch b so a becomes LRU
-        (void)s.read_page(b, 0);
-        const auto evicted = s.evict_until_free(2);
-        CHECK(evicted.size() == 1, "evict_until_free evicts exactly 1");
-        CHECK(!s.contains(a), "LRU victim = a (untouched)");
-        CHECK(s.contains(b) && s.contains(c), "b (recent) and c survive");
-        // read a's data must now fail (it's gone)
-        CHECK(!s.read_page(a, 0).has_value(), "evicted group unreadable");
-    }
-
-    // ---------- 5. crc corruption detection ----------
-    {
-        DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = 10});
-        auto g = s.reserve(2);
-        std::vector<std::byte> buf(2 * stride, std::byte{0xAB});
-        s.write_group(*g, std::span<const std::byte>(buf.data(), buf.size()));
-        CHECK(s.publish(*g), "publish");
-        // simulate corruption by writing into the mapped range via a new group that
-        // overlaps? No — instead use read after direct page write to a DIFFERENT group
-        // that reuses freed slots. Simplest honest test: write a known group, release,
-        // evict, reserve a new group over the same slots, write different bytes, then
-        // the OLD group id is dead (contains=false). Corruption path is covered by
-        // crc mismatch on read_group; emulate by flipping a byte in a live page via
-        // write_page on an unpublished group is not allowed. So: verify read_group
-        // rejects wrong-size dst and a released-then-evicted group.
-        std::vector<std::byte> tiny(1);
-        CHECK(!s.read_group(*g, std::span<std::byte>(tiny.data(), 1)), "wrong-size read rejected");
-        s.release(*g);
-        s.evict(*g);
-        CHECK(!s.contains(*g), "evicted group not restorable");
-    }
-
-    // ---------- 6. benchmark: write + restore throughput ----------
-    {
-        const std::uint32_t bench_pages = 600; // ~0.9GB at 1.51MiB/page
-        DiskKVStore s(DiskKVStore::Options{.path = path, .page_stride = stride, .max_pages = bench_pages + 10});
-        std::vector<std::byte> big(bench_pages * stride);
-        for (std::size_t i = 0; i < big.size(); i += 4096) big[i] = static_cast<std::byte>(i);
-        auto g = s.reserve(bench_pages);
-        auto t0 = std::chrono::steady_clock::now();
-        s.write_group(*g, std::span<const std::byte>(big.data(), big.size()));
-        s.publish(*g);
-        auto t1 = std::chrono::steady_clock::now();
-        const double wmbps = (bench_pages * stride) / 1e6 / std::chrono::duration<double>(t1 - t0).count();
-
-        std::vector<std::byte> big2(bench_pages * stride);
-        auto t2 = std::chrono::steady_clock::now();
-        bool read_ok = s.read_group(*g, std::span<std::byte>(big2.data(), big2.size()));
-        auto t3 = std::chrono::steady_clock::now();
-        const double rmbps = (bench_pages * stride) / 1e6 / std::chrono::duration<double>(t3 - t2).count();
-        CHECK(read_ok && std::memcmp(big.data(), big2.data(), big.size()) == 0, "big group round-trip");
-        std::printf("bench: %u pages x %.3fMiB = %.2fGB  write %.1fMB/s  read(restore) %.1fMB/s\n",
-                    bench_pages, stride / 1048576.0, (bench_pages * stride) / 1e9, wmbps, rmbps);
-        const double ms_per_full_restore = (bench_pages * stride) / 1e6 / rmbps * 1000.0;
-        std::printf("bench: full restore of this group ~= %.0f ms at measured read rate\n", ms_per_full_restore);
-    }
-
-    std::printf("\n%s: %d failure(s)\n", failures ? "TEST FAILED" : "ALL TESTS PASSED", failures);
-    return failures ? 1 : 0;
+    std::printf(failures == 0 ? "ALL PASS\n" : "%d FAILURES\n", failures);
+    return failures == 0 ? 0 : 1;
 }

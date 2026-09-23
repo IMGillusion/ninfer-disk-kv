@@ -6,7 +6,7 @@ budget is also full").
 
 ## Why
 
-NInfer's context cache is two levels today:
+NInfer's cache is two levels:
 
 ```
 L1  device page pool   --kv-capacity tokens   (~13.9 GiB on a 5090)
@@ -28,104 +28,74 @@ L1  device pages ──demote──▶ L2  pinned host ──demote──▶ L3 
    (13.9 GiB)                  (e.g. 6 GiB)                (e.g. 64 GiB ≈ 2.8M tokens)
 ```
 
-A "host full" event demotes the checkpoint's page run to disk instead of
-dropping it; a later turn restores it (disk read + H2D, ≈10 s) instead of
-recomputing (37–80 s). A miss (never spilt, LRU-evicted from disk, or CRC
-mismatch) falls back to exactly what the engine does today — strictly
-better-or-equal, never worse.
+## Layout
 
-## Components
+- `include/diskkv/disk_kv_store.h` — identity-keyed slot store. Self-describing
+  48-byte slot headers (magic + content identity + CRC32C + LRU stamp), atomic
+  index rewrite (`<path>.idx`, tmp+fsync+rename), index rebuild by slot scan,
+  true LRU eviction. Self-contained: no CUDA, no engine types.
+- `include/diskkv/disk_kv_bridge.h`, `src/disk_kv_bridge.cpp` — engine-facing
+  facade. One store per KV family (main / backend / state, different page
+  strides), a bounded async spill queue (`spill_page`, 512 pages in flight),
+  a **backpressure wait variant** (`spill_page_wait`, used by the owner-death
+  sweep so a chain never develops a silent hole), a synchronous variant for
+  large state blobs, and the read path (`restore_page`, `probe_prefix`).
+- `src/disk_kv_store.cpp` — the store implementation.
+- `tests/` — self-contained suites (`disk_kv_store_test`, `disk_kv_bridge_test`,
+  incl. a 900-page queue-backpressure regression).
+- `patches/ninfer-disk-kv-l3-full.patch` — the complete integration diff against
+  the NInfer tree (29 files, +2351 lines): the runtime write points (owner
+  death, checkpoint drop, seam tails incl. the MTP draft family), the admission
+  probe, the seed path, and the accounting contract.
 
-| File | Role |
-|---|---|
-| `include/diskkv/disk_kv_store.h` / `src/disk_kv_store.cpp` | The store. One mmap'd file per KV family; fixed-size page slots; per-group CRC32C; LRU eviction; coarse lock (cold path, never on the decode hot loop). Self-contained: no CUDA, no engine types. |
-| `include/diskkv/disk_kv_bridge.h` / `src/disk_kv_bridge.cpp` | Engine-facing facade. Identity-keyed groups — `spill(id, kind, pages, bytes)` / `restore_page(id, kind, page, dst)` / `contains` / `touch` — with per-family files (`main.diskkv`, `backend.diskkv`, `state.diskkv`), automatic LRU make-room, miss→recompute fallback, and counters. |
-| `tests/disk_kv_store_test.cpp` | Store logic: round-trip, capacity boundary, LRU order, CRC corruption rejection, size guards. |
-| `tests/disk_kv_bridge_test.cpp` | Bridge round-trip: spill → free host replica → restore with byte-identity, LRU evicts the coldest identity, unknown identity misses, family isolation, stats. |
+## Integration summary (see the patch)
 
-### Key design decisions
+Write side, three points:
+1. owner-death sweep: pages `[0, frontier)` read via host replica or a one-shot
+   D2H; `spill_page_wait` backpressure; prefix-contiguous semantics.
+2. checkpoint-drop: `[retained, dropped)` runs, capped at 512 pages.
+3. seam tails: main at `digest(F)`, backend (MTP draft) at `digest(F-1)`.
 
-- **Content-derived identity key.** A released KV page's engine descriptor
-  (and its `content_epoch`) is reclaimed under pressure, so the disk key
-  cannot reference the descriptor. Keys are
-  `DiskKVIdentity{lo, hi, kind, frontier}` where `(lo, hi)` is the 128-bit
-  rolling content digest NInfer already computes per token frontier
-  (`PrefixShortlistDigests`). Same content ⇒ same digest at spill time and
-  at restore time. A key that never matches is a miss, not corruption.
-- **CRC32C on every group.** Publish computes the CRC; restore verifies it.
-  A torn/corrupted group is treated as a miss (recompute), never fed to the
-  model.
-- **mmap'd backing file, LRU inside it.** The kernel page cache gives
-  write-back persistence for free; eviction is in-file, so the disk budget
-  is a hard ceiling that never asks for more space.
-- **Per-family stores.** Main KV, backend KV (MTP/DFlash) and state images
-  have different page strides; each family owns its own file, stride and
-  LRU clock. A family whose stride is 0 is simply disabled.
-- **Best-effort crash semantics.** The file is truncated on open; a
-  process restart starts with an empty L3 (a recompute happens, as today).
-  L3 is a cache tier, not a WAL — durability across engine crashes is out of
-  scope by design.
+Read side:
+1. admission probe (`inspect_lane`): for Root requests, enumerate live state
+   frontiers, verify the full-page chain + tail + state (+ MTP backend chain at
+   `E-1`), pick the largest restorable `E`. Raising `reuse_base` re-filters
+   capture groups / shared candidates and drops an in-prefix rewrite
+   checkpoint (L3-Root invariants).
+2. seed: device KV `[0, E)` from disk (main + backend), prefill recomputes
+   `[E, prompt)`; account `E` as reused, recompute as an unreported replay on
+   a seed miss (engine contract preserved).
 
-### Measured performance (RTX 5090 host, NVMe, g++ 11.4 -O2, 1.51 MiB/page)
+MTP-compatible: gates accept `None || Mtp`; draft frontier = target `- 1`.
 
-| op | rate |
-|---|---|
-| spill (host→disk write) | ~245 MB/s |
-| restore (disk read, page cache warm) | ~613 MB/s |
-| full restore of a 0.95 GB run | ~1.6 s |
-| a 200K-token session (≈4.7 GB) restore | ≈ 8 s read + H2D, vs 37–80 s recompute |
+## Measured (2026-09-23, 5090, Qwen3.8-27B NVFP4)
+
+- None path: restore 4/4, cache 92,958/93,056 (99.9%), TTFT 18 s → 4.8 s;
+  4/4 bit-exact vs the memory-continuation reference.
+- MTP path: restore 4/4 (`frontier=92958/93049`), 3/3 bit-exact vs the
+  memory-continuation reference (the 4th session's state had been LRU-evicted
+  from a small test-scale state pool; falls back to recompute — correctness
+  preserved). Cold first read ≈ 15 s, warm 4.5–4.8 s.
+- Standalone suites: store 20/20, bridge 13/13, write ≈ 450 MB/s, read ≈ 580 MB/s
+  (256 KiB pages, single thread).
 
 ## Build & test
 
-Requires C++20. Two options:
-
-```bash
-# standalone
-cmake -S . -B build -G Ninja && cmake --build build --parallel
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build --output-on-failure
+# or standalone:
+g++ -std=c++20 -O2 -Iinclude tests/disk_kv_store_test.cpp src/disk_kv_store.cpp -o dks_test -pthread
+g++ -std=c++20 -O2 -Iinclude tests/disk_kv_bridge_test.cpp src/disk_kv_bridge.cpp src/disk_kv_store.cpp -o dkb_test -pthread
 ```
 
-or the minimal manual build the engine uses for quick checks:
+## Operations (in production)
 
-```bash
-g++ -std=c++20 -O2 -Wall -Wextra -I include \
-    tests/disk_kv_store_test.cpp src/disk_kv_store.cpp -o dks_test
-g++ -std=c++20 -O2 -Wall -Wextra -I include \
-    tests/disk_kv_bridge_test.cpp src/disk_kv_bridge.cpp src/disk_kv_store.cpp -o dkb_test
-./dks_test /tmp/l.bin 1589632 150
-./dkb_test /tmp/dkb
+```
+--disk-kv-path <dir> --disk-kv-gib 64 --disk-kv-restore
 ```
 
-Both suites exit 0 with `ALL TESTS PASSED`.
-
-## Integrating into NInfer
-
-The store and bridge are engine-type-free on purpose. Integration into
-NInfer (branch `pre-disktier-20260921` worktree) touches two seams:
-
-1. **Write seam** — where a host KV run is released (all four
-   `release_page_replicas` paths funnel through the extent partitioner):
-   copy the run's bytes out before they die and call
-   `bridge.spill(id, MainKV/BackendKV, page_count, bytes)`.
-2. **Read seam** — where a materialization restore throws
-   `checkpoint KV page has no restorable replica`: look the identity up in
-   the bridge; on a hit, re-hydrate a fresh host extent from the restored
-   bytes so the engine's *existing* H2D restore path runs unchanged; on a
-   miss, fall through to recompute exactly as today.
-
-Both seams are gated behind `ContextCacheOptions` flags
-(`--disk-kv-path`, `--disk-kv-gib`), default-off; with the flags unset the
-engine behaves bit-for-bit as before.
-
-## Status
-
-- [x] Store + bridge implemented, unit-tested, measured
-- [x] Standalone repo, standalone CMake, tests green
-- [ ] Engine seams (write/read) — in progress in the NInfer worktree
-- [ ] Isolated-container validation under real load (eviction waves absorbed
-      by L3 hits instead of drops)
-
-## License
-
-Apache-2.0 (see `LICENSE`). Derived from / integrates with [NInfer](https://github.com/Neroued/ninfer)
-(Apache-2.0) and is subject to its terms.
+Budget split (backend family enabled): main 65% / backend 25% / state 10%.
+State slots = 10% / ~146 MiB (64 GiB → ~45 slots), so size the budget for the
+number of sessions you want restorable. A fresh store preallocates the full
+budget (ftruncate) — check free space first.

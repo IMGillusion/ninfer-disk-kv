@@ -1,18 +1,30 @@
 #pragma once
-// L3 (disk) tier for the KV cache hierarchy.
+// L3 (disk) tier for the KV cache hierarchy — persistent, self-describing,
+// true-LRU.
 //
-// NInfer's cache is today two levels: a device page pool (kv-capacity tokens)
-// and a pinned host arena (--host-kv-mib). When the host arena is full, the
-// pressure planner drops the affected checkpoint PERMANENTLY, and the next
-// turn of that session pays full prefill recompute. This module is a cold,
-// file-backed third level so that a "host full" event demotes a checkpoint's
-// page run to disk instead of dropping it, and a later turn can restore it
-// (disk read + H2D) instead of recomputing.
+// NInfer's cache is two levels: a device page pool (kv-capacity tokens) and a
+// pinned host arena (--host-kv-mib). When the host arena fills, the pressure
+// planner used to DROP the affected checkpoints permanently, so the next turn
+// of that session paid full prefill recompute. This store is a cold,
+// file-backed third level: a host-full event demotes a page run to disk, and
+// a later turn restores it (disk read + H2D) instead of recomputing.
 //
-// The store is deliberately self-contained (no CUDA, no engine types) so it
-// builds and unit-tests in seconds and can be dropped behind the host arena
-// as a transparent cold backing. The engine drives it with plain (page_stride,
-// page_count) groups and host byte buffers; it never touches device memory.
+// PERSISTENCE MODEL (engine restarts happen — watchdog + manual; data that
+// dies with the process is worth nothing):
+//   * DATA file: 4KiB-aligned slots, each with a 48-byte SELF-DESCRIBING
+//     header (magic + content identity + CRC32C + LRU timestamp). Slot
+//     placement is managed by the store (free pool), NOT by a hash of the
+//     identity — identity->slot lives in the index.
+//   * INDEX file (<path>.idx): the identity->slot mapping, rewritten
+//     atomically (tmp + fsync + rename) whenever the live set changes.
+//   * Open: valid index -> fast path. Missing/corrupt index -> rebuild by
+//     scanning slot headers (slow, one-time; CRC-verified).
+//
+// EVICTION: true LRU over the live set (lowest last_used first). Reads and
+// explicit touches refresh last_used, so an active session's pages outlive
+// the coldest sessions'.
+//
+// Self-contained (no CUDA, no engine types): builds and unit-tests in seconds.
 
 #include <cstddef>
 #include <cstdint>
@@ -20,147 +32,167 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer {
 
-/**
- * A "group" is a contiguous run of KV pages belonging to one checkpoint
- * (one continuation). `page_stride` is the byte size of ONE page (the engine's
- * HostKVPageLayout.page_stride), so a group is page_count * page_stride bytes.
- *
- * Lifecycle:
- *   reserve(group) -> write pages -> publish()          (now restorable)
- *   ... later, possibly under pressure ...
- *   release(group)                                (now evictable)
- *
- * A published group stays addressable (read() returns its bytes) until it is
- * evicted by LRU pressure or the store is cleared. Evicted groups are LOST
- * (the engine then falls back to recompute, exactly as today) — so this tier is
- * strictly "better than today", never worse.
- */
+/** Content identity of one KV page (mirrors the engine's prefix digest). */
+struct DiskKVIdentity {
+    std::uint64_t lo       = 0;  // rolling digest of the prefix at the page end
+    std::uint64_t hi       = 0;
+    std::uint32_t tag      = 0;  // engine identity_tag (spec backend | proposal<<8 | dtype<<16)
+    std::uint32_t frontier = 0;  // page end token position (observability)
+
+    [[nodiscard]] bool operator==(const DiskKVIdentity&) const noexcept = default;
+};
+
+struct DiskKVIdentityHash {
+    std::size_t operator()(const DiskKVIdentity& id) const noexcept {
+        std::uint64_t h = id.lo;
+        h ^= id.hi + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::uint64_t(id.tag) * 0xff51afd7ed558ccdULL;
+        h ^= std::uint64_t(id.frontier) * 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 31;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        return static_cast<std::size_t>(h);
+    }
+};
+
 class DiskKVStore {
 public:
     struct Options {
-        std::string path;          // data file (created/truncated on open)
-        std::size_t page_stride    = 0;   // bytes per page (from HostKVPageLayout)
-        std::size_t capacity_bytes = 0;   // 0 = auto from page_stride & max_pages
-        std::uint32_t max_pages    = 0;   // 0 = derived from capacity_bytes/page_stride
-        bool verify_crc            = true; // recompute+check crc on every read
+        std::string path;         // data file (created if absent; NEVER truncated)
+        std::size_t slot_size    = 0;   // bytes per KV page (engine page stride)
+        std::size_t capacity_bytes = 0; // 0 = invalid (one of the two is required)
+        std::uint32_t max_slots   = 0;  // explicit capacity (preferred)
+        bool verify_crc          = true;
     };
 
-    /** Per-group metadata surfaced to the engine for its cost/planner model. */
-    struct GroupInfo {
-        std::uint32_t group_id   = 0;
-        std::uint32_t page_count = 0;
-        bool          published  = false;
-        bool          evictable  = false; // published && released
-        std::uint64_t crc32      = 0;
-    };
-
-    /** Open (create/truncate) the backing file. Throws on failure. */
+    /** Open the backing file and the identity index. Throws on I/O errors or
+     *  a data file laid out for a different geometry. */
     explicit DiskKVStore(Options opts);
     ~DiskKVStore();
 
     DiskKVStore(const DiskKVStore&)            = delete;
     DiskKVStore& operator=(const DiskKVStore&) = delete;
 
-    [[nodiscard]] std::size_t page_stride()   const noexcept { return opts_.page_stride; }
-    [[nodiscard]] std::uint32_t page_capacity() const noexcept { return max_pages_; }
-    [[nodiscard]] std::uint32_t used_pages()   const noexcept;
-    [[nodiscard]] std::size_t  free_bytes()   const noexcept;
-    [[nodiscard]] std::size_t  used_bytes()   const noexcept;
-    [[nodiscard]] const std::string& path()   const noexcept { return opts_.path; }
+    [[nodiscard]] std::size_t    slot_size()  const noexcept { return opts_.slot_size; }
+    [[nodiscard]] std::uint32_t  slot_count() const noexcept { return max_slots_; }
+    [[nodiscard]] std::uint32_t  live_slots() const noexcept;
+    [[nodiscard]] std::size_t    used_bytes() const noexcept;
+    [[nodiscard]] std::size_t    free_bytes() const noexcept;
+    [[nodiscard]] const std::string& path() const noexcept { return opts_.path; }
+    [[nodiscard]] bool            index_rebuilt_from_scan() const noexcept { return rebuilt_from_scan_; }
 
-    /**
-     * Reserve a group of `page_count` pages. Returns a group id, or nullopt if
-     * there is no room (the caller may evict LRU groups and retry). Reserved
-     * groups are NOT yet restorable; they must be filled with write_page()
-     * and then publish().
-     */
-    [[nodiscard]] std::optional<std::uint32_t> reserve(std::uint32_t page_count);
+    /** Insert (or refresh) the page. When the store is full, evicts the
+     *  LRU page first (its id reported via `evicted`, may be null).
+     *  Returns false only when the store is full and no slot was evictable. */
+    bool upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
+                     std::vector<std::uint32_t>* evicted = nullptr);
 
-    /** Write one page of a reserved/published group (0-based within the group). */
-    bool write_page(std::uint32_t group_id, std::uint32_t page_index,
-                    const std::byte* src);
-    /** Bulk-write a whole group from a contiguous buffer of page_count*stride. */
-    bool write_group(std::uint32_t group_id, std::span<const std::byte> bytes);
+    /** Read the page into `dst` (slot_size bytes). Identity + CRC verified;
+     *  refreshes the LRU timestamp. */
+    bool read_page(const DiskKVIdentity& id, std::span<std::byte> dst);
 
-    /** Make the group restorable. Recomputes its crc. Returns false if not all
-     *  pages were written. */
-    bool publish(std::uint32_t group_id);
+    /** Presence check (cheap; no data read, no LRU refresh). */
+    [[nodiscard]] bool contains(const DiskKVIdentity& id) const;
 
-    /** Mark a group no longer needed; it becomes LRU-evictable. */
-    bool release(std::uint32_t group_id);
+    /** Refresh the slot's LRU timestamp without reading the page. */
+    bool touch(const DiskKVIdentity& id);
 
-    /** Refresh the group's LRU position (call after a successful restore/read). */
-    bool touch(std::uint32_t group_id);
+    /** Evict a specific page (if it currently holds `id`). */
+    bool evict(const DiskKVIdentity& id);
 
-    /** Read one page of a published (not yet evicted) group. */
-    [[nodiscard]] std::optional<std::span<const std::byte>>
-    read_page(std::uint32_t group_id, std::uint32_t page_index) const;
+    /** LRU-evict until `free` slots are free. Returns evicted identities. */
+    [[nodiscard]] std::vector<DiskKVIdentity> evict_until_free(std::uint32_t free);
 
-    /** Read the whole group; copies into `dst` (page_count*stride bytes). */
-    [[nodiscard]] bool read_group(std::uint32_t group_id, std::span<std::byte> dst) const;
+    /** Identities of every live page in this store (read-side frontier scan:
+     *  the engine matches its own digest chain against each live state
+     *  frontier to find a restorable boundary). Bounded by max_slots. */
+    [[nodiscard]] std::vector<DiskKVIdentity> live_identities() const;
 
-    /** True if the group is currently restorable (published, not yet evicted). */
-    [[nodiscard]] bool contains(std::uint32_t group_id);
+    /** Slot indices currently live (diagnostics). */
+    [[nodiscard]] std::vector<std::uint32_t> live_slot_list() const;
 
-    /**
-     * Evict LRU groups until at least `free_pages` pages are free. Returns
-     *  the ids of the groups evicted (empty if none were needed). Never
-     *  evicts non-evictable groups. All public methods take an internal lock,
-     *  so a read_page() span stays valid until the NEXT call on this store;
-     *  copy it out immediately (the restore path does, into the host arena).
-     */
-    [[nodiscard]] std::vector<std::uint32_t> evict_until_free(std::uint32_t free_pages);
+    /** Public durability point (worker thread / tests): persist pending
+     *  in-memory LRU/index changes to the index file. */
+    void flush_index();
 
-    /** Evict a specific group (if evictable). */
-    bool evict(std::uint32_t group_id);
-
-    /** Drop everything (keeps the file, frees all groups). */
-    void clear() noexcept;
-
-    /** Snapshot of group metadata (for logging / planner cost model). */
-    [[nodiscard]] std::vector<GroupInfo> groups() const;
-
-    /** Total pages evicted since open (for observability). */
-    [[nodiscard]] std::uint64_t evicted_pages_total() const noexcept { return evicted_pages_total_; }
-    [[nodiscard]] std::uint64_t published_groups_total() const noexcept { return published_groups_total_; }
-
+    static constexpr std::size_t kSlotHeaderSize = 48;
     static std::uint64_t crc32c(std::span<const std::byte> data);
 
 private:
-    struct Group {
-        std::uint32_t first_page = 0;   // first slot index in the file
-        std::uint32_t page_count = 0;
-        std::uint32_t written    = 0;   // pages written so far
-        bool          published  = false;
-        bool          released   = false;
-        std::uint64_t crc        = 0;
-        std::uint64_t last_used  = 0;  // LRU clock
+    struct Header {  // on-disk, 48 bytes, head of every slot
+        std::uint32_t magic     = 0;
+        std::uint32_t reserved  = 0;
+        std::uint64_t last_used = 0;
+        std::uint64_t lo        = 0;
+        std::uint64_t hi        = 0;
+        std::uint32_t tag       = 0;
+        std::uint32_t frontier  = 0;
+        std::uint32_t crc       = 0;
+        std::uint32_t pad       = 0;
+        static constexpr std::uint32_t kMagic = 0x4E44564B;  // 'NKVD'
     };
 
-    std::uint32_t find_free_run(std::uint32_t pages) const;
-    void          reclaim_run(std::uint32_t first, std::uint32_t pages);
-    bool          valid_group(std::uint32_t id) const noexcept;
-    bool          evict_unlocked(std::uint32_t group_id);   // caller holds mu_
+    struct IdxEntry {  // on-disk index row, 32 bytes
+        std::uint64_t lo       = 0;
+        std::uint64_t hi       = 0;
+        std::uint32_t tag      = 0;
+        std::uint32_t frontier = 0;
+        std::uint32_t slot     = 0;
+        std::uint32_t pad      = 0;
+    };
+
+    struct IdxHeader {  // on-disk index header, 32 bytes
+        std::uint32_t magic   = 0;  // 'KDVI'
+        std::uint32_t version = 0;
+        std::uint32_t count   = 0;
+        std::uint32_t slot_size = 0;
+        std::uint32_t max_slots = 0;
+        std::uint64_t clock   = 0;  // LRU timestamp base, survives restarts
+        static constexpr std::uint32_t kMagic = 0x4944564B;
+    };
+
+    [[nodiscard]] std::size_t slot_bytes() const noexcept;
+    [[nodiscard]] std::size_t data_bytes() const noexcept;
+    [[nodiscard]] std::size_t trailer_off() const noexcept;
+    [[nodiscard]] std::size_t page_off(std::uint32_t slot) const noexcept;
+    [[nodiscard]] Header* slot_hdr(std::uint32_t slot) const;
+    [[nodiscard]] const Header* slot_hdr_c(std::uint32_t slot) const;
+    [[nodiscard]] bool identity_matches(const Header& h, const DiskKVIdentity& id) const;
+
+    void create_fresh();
+    bool load_index();                    // fast path; false -> caller rebuilds
+    void rebuild_from_scan();             // slow path: scan all slot headers
+    /** Rewrite the index file atomically (tmp+rename, no fsync on hot path).
+     *  A torn index is safe: next open falls back to a header rescan. */
+    void persist_index_unlocked();
     std::uint64_t bump_clock() noexcept;
+    void zero_slot(std::uint32_t slot);
+    void record_live(const DiskKVIdentity& id, std::uint32_t slot, std::uint64_t last_used);
+    void release_slot(std::uint32_t slot);
+    struct EvictedPage {
+        DiskKVIdentity id;
+        std::uint32_t slot;
+    };
+    /** LRU core: evict the lowest-last_used live slot. Caller holds mu_. */
+    std::optional<EvictedPage> evict_one_lru();
 
-    mutable std::mutex mu_;    // guards all state below (coarse lock; cold path)
-    Options       opts_;
-    int           fd_          = -1;
-    std::byte*    base_        = nullptr;   // mmap of the data file
-    std::size_t   file_bytes_  = 0;
-    std::uint32_t max_pages_   = 0;
+    mutable std::mutex mu_;
+    Options      opts_;
+    int          fd_         = -1;
+    std::byte*   base_       = nullptr;
+    std::size_t  file_bytes_ = 0;
+    std::size_t  slot_pitch_ = 0;
+    std::uint32_t max_slots_ = 0;
+    std::uint64_t clock_     = 0;
+    bool         rebuilt_from_scan_ = false;
 
-    std::vector<Group> groups_;             // index == group id
-    std::vector<bool>  slot_used_;          // per-slot in-use flag
-    std::uint32_t      used_pages_   = 0;
-    std::uint64_t      clock_        = 0;
-    std::uint64_t      evicted_pages_total_      = 0;
-    std::uint64_t      published_groups_total_   = 0;
-    std::vector<std::uint32_t> free_list_;     // free first-slots (coalesced not required)
+    std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
+    std::vector<std::uint32_t> free_slots_;
 };
 
 } // namespace ninfer

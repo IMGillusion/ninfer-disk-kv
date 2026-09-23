@@ -1,17 +1,13 @@
-// Bridge round-trip test: spill a host KV run to disk, free the host replica,
-// restore it back, verify byte-identity, and prove LRU eviction + miss fallback.
-//
-// This exercises DiskKVBridge directly (identity-keyed groups). It uses a real
-// HostKVPageLayout-derived page_stride value so the byte geometry matches the
-// engine's. Build with g++ -std=c++20 -O2 against core/disk_kv_bridge.cpp and
-// core/disk_kv_store.cpp, then run: ./dkb_test <tmpdir>
-
+// Suite for DiskKVBridge (v2): round-trip, per-family isolation, dedupe,
+// bounded-queue backpressure (spill_page_wait regression), stats.
+// Build: g++ -std=c++20 -O2 -Iinclude tests/disk_kv_bridge_test.cpp src/disk_kv_bridge.cpp src/disk_kv_store.cpp -o dkb_test -pthread
+// Run:   ./dkb_test <dir>
 #include "diskkv/disk_kv_bridge.h"
 
 #include <chrono>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -23,83 +19,85 @@ static int failures = 0;
     else { std::printf("ok:   %s\n", msg); } \
 } while (0)
 
+static DiskKVIdentity make_id(std::uint64_t seed, std::uint32_t frontier) {
+    return DiskKVIdentity{.lo       = 0x9e3779b97f4a7c15ULL * (seed + 1),
+                          .hi       = 0xbf58476d1ce4e5b9ULL ^ (seed * 0x94d049bb133111ebULL),
+                          .tag      = 0x30101,
+                          .frontier = frontier};
+}
+
 int main(int argc, char** argv) {
-    const std::string dir = argc > 1 ? argv[1] : "/tmp/dkb";
-    // Real main-KV page stride from a typical 28-layer GQA geometry (MiB-scale).
-    const std::size_t stride = 1589632; // 1.516 MiB
+    const std::string dir = argc > 1 ? argv[1] : "/tmp/dkb_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
 
-    DiskKVBridge b(DiskKVBridge::Options{
-        .base_path            = dir,
-        .main_page_stride     = stride,
-        .backend_page_stride  = stride,
-        .state_page_stride    = 0,             // state family disabled here
-        .capacity_bytes       = 0,
-        .max_pages            = 30,            // ~46 MB of MainKV on disk (3 runs of 10)
-        .verify_crc           = true});
+    const std::size_t main_stride    = 65536;
+    const std::size_t backend_stride = 32768;
+    const std::size_t state_stride   = 131072;
+    // Budget split with all three families on: main 65% / backend 25% / state 10%.
+    // 160 MiB -> main ~104 MiB (1600+ pages) — room for the 900-page queue test.
+    DiskKVBridge b(DiskKVBridge::Options{.base_path           = dir,
+                                         .main_page_stride    = main_stride,
+                                         .backend_page_stride = backend_stride,
+                                         .state_page_stride   = state_stride,
+                                         .capacity_bytes      = 160ULL << 20,
+                                         .verify_crc          = true});
     CHECK(b.enabled(), "bridge enabled");
-    CHECK(b.path(DiskKVKind::MainKV).find("main.diskkv") != std::string::npos, "main family path");
 
-    // ---- 1. spill + restore one page-run, verify identity ----
-    DiskKVIdentity id{.lo = 0xA11CE, .hi = 0xBEEF, .kind = 0, .frontier = 4096};
-    const std::uint32_t pages = 10;
-    std::vector<std::byte> src(static_cast<std::size_t>(pages) * stride);
-    for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::byte>((i * 131 + 17) & 0xFF);
-    bool spilled = b.spill(id, DiskKVKind::MainKV, pages, std::span<const std::byte>(src.data(), src.size()));
-    CHECK(spilled, "spill 10-page run");
-    CHECK(b.contains(id, DiskKVKind::MainKV), "identity now restorable");
-    CHECK(b.used_bytes(DiskKVKind::MainKV) == static_cast<std::size_t>(pages) * stride, "used bytes == run");
+    // ---------- 1. spill + wait + contains + restore round-trip ----------
+    const auto id = make_id(1, 64);
+    std::vector<std::byte> page(main_stride);
+    for (std::size_t i = 0; i < main_stride; ++i) page[i] = std::byte((i * 17 + 3) & 0xFF);
+    CHECK(b.spill_page(id, DiskKVKind::MainKV, page), "spill queued");
+    b.wait_idle();
+    CHECK(b.contains(id, DiskKVKind::MainKV), "contains after wait_idle");
+    std::vector<std::byte> out(main_stride);
+    CHECK(b.restore_page(id, DiskKVKind::MainKV, out) &&
+              std::memcmp(out.data(), page.data(), main_stride) == 0,
+          "restore round-trip identical");
 
-    std::vector<std::byte> dst(static_cast<std::size_t>(pages) * stride, std::byte{0});
-    bool any_read = true;
-    for (std::uint32_t p = 0; p < pages && any_read; ++p) {
-        std::span<std::byte> one(dst.data() + static_cast<std::size_t>(p) * stride, stride);
-        any_read = b.restore_page(id, DiskKVKind::MainKV, p, one);
+    // ---------- 2. per-family isolation ----------
+    std::vector<std::byte> bpage(backend_stride);
+    for (std::size_t i = 0; i < backend_stride; ++i) bpage[i] = std::byte((i * 29 + 5) & 0xFF);
+    CHECK(b.spill_page(id, DiskKVKind::BackendKV, bpage), "spill backend queued");
+    CHECK(b.spill_page_sync(id, DiskKVKind::StateImage,
+                            std::vector<std::byte>(state_stride, std::byte(0x77))),
+          "spill state (sync)");
+    b.wait_idle();
+    CHECK(b.contains(id, DiskKVKind::BackendKV) && b.contains(id, DiskKVKind::StateImage),
+          "backend/state present independently");
+    std::vector<std::byte> bout(backend_stride);
+    CHECK(b.restore_page(id, DiskKVKind::BackendKV, bout) &&
+              std::memcmp(bout.data(), bpage.data(), backend_stride) == 0,
+          "backend bytes independent of main");
+
+    // ---------- 3. dedupe hit accounting ----------
+    const auto st0 = b.stats();
+    CHECK(b.spill_page(id, DiskKVKind::MainKV, page), "re-spill (dedupe path)");
+    b.wait_idle();
+    CHECK(b.stats().spill_dups == st0.spill_dups + 1, "dedupe hit counted");
+
+    // ---------- 4. bounded-queue backpressure (spill_page_wait regression) ----------
+    // kQueueCap is 512; push 900 pages through the wait-variant: every page must
+    // land (no silent drops) even though the queue overflows repeatedly.
+    constexpr int kN = 900;
+    for (int i = 0; i < kN; ++i) {
+        std::vector<std::byte> p(main_stride, std::byte(i & 0xFF));
+        if (!b.spill_page_wait(make_id(10000 + i, 64), DiskKVKind::MainKV, p,
+                               std::chrono::milliseconds(5000))) {
+            CHECK(false, "spill_page_wait queued every page");
+            break;
+        }
     }
-    CHECK(any_read, "restore_page for all pages");
-    CHECK(std::memcmp(src.data(), dst.data(), src.size()) == 0, "round-trip bytes identical");
+    b.wait_idle();
+    int present = 0;
+    for (int i = 0; i < kN; ++i) {
+        if (b.contains(make_id(10000 + i, 64), DiskKVKind::MainKV)) { ++present; }
+    }
+    CHECK(present == kN, "all 900 backpressured pages restorable");
+    CHECK(b.stats().queue_drops == 0, "queue_drops stayed 0 (no silent drops)");
+    CHECK(b.stats().spills >= static_cast<std::uint64_t>(kN) + 3, "spill counter advanced");
 
-    // ---- 2. miss fallback: an identity never spilt must miss (recompute path) ----
-    DiskKVIdentity cold{.lo = 999, .hi = 1000, .kind = 0, .frontier = 777};
-    CHECK(!b.contains(cold, DiskKVKind::MainKV), "unknown identity absent");
-    std::vector<std::byte> missbuf(stride);
-    CHECK(!b.restore_page(cold, DiskKVKind::MainKV, 0, std::span<std::byte>(missbuf.data(), missbuf.size())),
-          "unknown identity restore misses");
-
-    // ---- 3. LRU eviction: fill past capacity, coldest identity must be evicted ----
-    // Capacity is 40 pages; id uses 10. Spill 3 more runs (30 pages) to hit 40, then a
-    // 4th run must evict the coldest (our id, untouched since spill).
-    DiskKVIdentity id2{.lo = 2, .hi = 2, .kind = 0, .frontier = 8192};
-    DiskKVIdentity id3{.lo = 3, .hi = 3, .kind = 0, .frontier = 12288};
-    DiskKVIdentity id4{.lo = 4, .hi = 4, .kind = 0, .frontier = 16384};
-    std::vector<std::byte> run2(static_cast<std::size_t>(pages) * stride, std::byte{0x11});
-    std::vector<std::byte> run3(static_cast<std::size_t>(pages) * stride, std::byte{0x22});
-    std::vector<std::byte> run4(static_cast<std::size_t>(pages) * stride, std::byte{0x33});
-    CHECK(b.spill(id2, DiskKVKind::MainKV, pages, std::span<const std::byte>(run2.data(), run2.size())), "spill id2");
-    CHECK(b.spill(id3, DiskKVKind::MainKV, pages, std::span<const std::byte>(run3.data(), run3.size())), "spill id3");
-    // touch id2 so it becomes the warmest
-    b.touch(id2, DiskKVKind::MainKV);
-    CHECK(b.spill(id4, DiskKVKind::MainKV, pages, std::span<const std::byte>(run4.data(), run4.size())), "spill id4 (triggers eviction)");
-    CHECK(!b.contains(id, DiskKVKind::MainKV), "coldest (id) evicted under pressure");
-    CHECK(b.contains(id2, DiskKVKind::MainKV), "warmest (id2) survives");
-
-    // ---- 4. restore still works for survivors ----
-    std::vector<std::byte> dst2(stride, std::byte{0});
-    CHECK(b.restore_page(id2, DiskKVKind::MainKV, 0, std::span<std::byte>(dst2.data(), dst2.size())), "restore survivor id2");
-    CHECK(dst2[0] == std::byte{0x11}, "survivor byte intact");
-
-    // ---- 5. backend family is isolated from main ----
-    DiskKVIdentity bid{.lo = 5, .hi = 5, .kind = 1, .frontier = 4096};
-    CHECK(b.spill(bid, DiskKVKind::BackendKV, 2, std::span<const std::byte>(run2.data(), 2 * stride)), "spill backend");
-    CHECK(b.used_bytes(DiskKVKind::BackendKV) == 2 * stride, "backend family counts separately");
-    CHECK(b.used_bytes(DiskKVKind::MainKV) != 0, "main family unaffected by backend spill");
-
-    // ---- 6. stats sanity ----
-    const DiskKVBridgeStats s = b.stats();
-    CHECK(s.spills >= 4, "stats.spills counted");
-    CHECK(s.spill_bytes >= 4 * static_cast<std::size_t>(pages) * stride, "stats.spill_bytes counted");
-    CHECK(s.restores == pages + 1, "stats.restores counted (10 + 1)");
-    CHECK(s.evicted_groups >= 1, "stats.evicted_groups counted");
-
-    std::printf("\n%s: %d failure(s)\n", failures ? "TEST FAILED" : "ALL TESTS PASSED", failures);
-    return failures ? 1 : 0;
+    std::printf(failures == 0 ? "ALL PASS\n" : "%d FAILURES\n", failures);
+    return failures == 0 ? 0 : 1;
 }

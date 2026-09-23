@@ -1,0 +1,2988 @@
+diff --git a/include/ninfer/engine.h b/include/ninfer/engine.h
+index b33ae47b..bd8ac280 100644
+--- a/include/ninfer/engine.h
++++ b/include/ninfer/engine.h
+@@ -77,6 +77,10 @@ public:
+     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
+     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+ 
++    // Decodes one token id back to its UTF-8 surface text (the artifact tokenizer's rendering).
++    // Used to present exported next-token log probabilities as readable tokens.
++    [[nodiscard]] std::string decode_token(std::uint32_t token_id) const;
++
+     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
+     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
+                                                   std::uint32_t first_target);
+diff --git a/include/ninfer/types.h b/include/ninfer/types.h
+index d8398774..74e98035 100644
+--- a/include/ninfer/types.h
++++ b/include/ninfer/types.h
+@@ -137,6 +137,29 @@ struct ContextCacheOptions {
+     std::optional<std::uint32_t> max_private_continuations;
+     std::optional<std::uint32_t> max_shared_prefixes;
+     std::optional<std::uint32_t> max_long_anchors_per_continuation;
++    // Opt-in retention policy for ONE long-lived conversation whose prompt only ever grows.
++    // A capture that the current request has proven to extend a resident checkpoint -- an exact
++    // shortlist-key match at that resident's frontier -- inherits the resident's demonstrated
++    // demand, so rolling the frontier forward is value-positive instead of competing against
++    // its own history. Off by default: when concurrent conversations share a prefix, this lets
++    // one conversation's extension evict the prefix the others depend on.
++    bool rolling_retention = false;
++    // L3 (disk) cold tier. Empty path = disabled (two-tier behavior, byte-identical).
++    // When set, host KV pages that are about to lose their last host replica
++    // (checkpoint drop under pressure) are spilled to per-family files under
++    // this directory so a later re-admission can restore them instead of
++    // re-prefilling. disk_kv_gib is the total spill budget (split across the
++    // KV families); 0 with a path set defaults to 64 GiB.
++    std::string disk_kv_path;
++    std::uint32_t disk_kv_gib = 0;
++    // Read side of the L3 tier: when a Root request arrives and its prefix
++    // [0, F) is restorable from disk (KV pages AND the GDN state image at F),
++    // materialize them into the fresh sequence (disk read + H2D + state load)
++    // and prefill only [F, prompt) instead of the whole prompt. Default off:
++    // with it off, the tier is write-only (probe/logging) and behavior is
++    // byte-identical to two-tier. Any restore failure falls back to full
++    // recompute (never worse than today).
++    bool disk_kv_restore = false;
+ };
+ 
+ struct ContextCostOptions {
+@@ -261,6 +284,9 @@ struct RequestOptions {
+     ExecutionOptions execution;
+     StopPolicy stop;
+     OutputOptions output;
++    // Export the top-K next-token probabilities of the first generated token. 0/absent means
++    // no export. The export is a prefill-only side channel and never affects sampling.
++    std::optional<std::uint32_t> top_logprobs;
+ };
+ 
+ enum class MediaKind : std::uint8_t {
+@@ -742,6 +768,15 @@ struct MaterializationDiagnostics {
+                const MaterializationDiagnostics&) noexcept = default;
+ };
+ 
++// One entry of the next-token probability distribution exported from a generation request.
++// Probability is the exact full-vocabulary softmax over the raw prefill logits (no sampling
++// temperature/penalties applied), so the exported entries sum to at most 1.
++struct TopLogprob {
++    std::uint32_t token_id   = 0;
++    float         probability = 0.0F;
++    std::string   token_text;
++};
++
+ struct GenerationResult {
+     PromptSummary prompt;
+     std::vector<TokenId> generated_token_ids;
+@@ -759,6 +794,11 @@ struct GenerationResult {
+     GenerationEngineTiming engine_timing;
+     SpeculativeStats speculative;
+     ThinkingBudgetStats thinking;
++    // Set only when the request asked for next-token log probabilities (RequestOptions::
++    // top_logprobs). Contains the sorted top-K of the exact next-token distribution for the
++    // first generated token; the distribution is computed from prefill logits and does not
++    // require any decode round.
++    std::optional<std::vector<TopLogprob>> next_token_top_logprobs;
+ };
+ 
+ struct ArenaMemorySummary {
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 98052fdb..70389777 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -22,6 +22,8 @@ add_library(ninfer_core STATIC
+   core/gdn_replay_records.cpp
+   core/cyclic_kv_cache.cpp
+   core/host_kv_arena.cpp
++  core/disk_kv_store.cpp
++  core/disk_kv_bridge.cpp
+   core/paged_kv_cache.cpp
+   core/linear_attention_state.cpp
+   core/layout.cpp
+diff --git a/src/core/disk_kv_bridge.cpp b/src/core/disk_kv_bridge.cpp
+new file mode 100644
+index 00000000..4a222986
+--- /dev/null
++++ b/src/core/disk_kv_bridge.cpp
+@@ -0,0 +1,305 @@
++#include "core/disk_kv_bridge.h"
++
++#include <algorithm>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++
++namespace ninfer {
++
++namespace {
++
++std::string family_path(const std::string& base, DiskKVKind kind) {
++    const char* name = kind == DiskKVKind::MainKV ? "main"
++                     : kind == DiskKVKind::BackendKV ? "backend" : "state";
++    return base + "/diskkv_" + name;
++}
++
++// Split the total budget across enabled families: 60% main / 30% backend /
++// 10% state (main KV dominates the working set in the 9-agent profile).
++std::size_t family_budget(std::size_t total, std::size_t stride, std::uint32_t share,
++                         std::uint32_t denominator) {
++    if (stride == 0) { return 0; }
++    const std::size_t bytes = total * share / denominator;
++    return (bytes / stride) * stride;
++}
++
++} // namespace
++
++DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
++    if (opts_.base_path.empty() || opts_.capacity_bytes == 0) {
++        enabled_ = false;  // explicit off
++        return;
++    }
++    if (opts_.main_page_stride == 0) {
++        throw std::invalid_argument("disk kv bridge needs main_page_stride");
++    }
++    auto make_family = [&](DiskKVKind kind, std::size_t family_stride, std::size_t budget) {
++        Family& f       = families_[kind_index(kind)];
++        f.stride        = family_stride;
++        f.path          = family_path(opts_.base_path, kind);
++        if (family_stride == 0 || budget == 0) { return; }  // family disabled
++        std::error_code ec;
++        std::filesystem::create_directories(std::filesystem::path(f.path).parent_path(), ec);
++        DiskKVStore::Options sopts;
++        sopts.path           = f.path;
++        sopts.slot_size      = family_stride;
++        sopts.capacity_bytes = budget;
++        sopts.max_slots      = 0;  // derived from capacity_bytes
++        sopts.verify_crc     = opts_.verify_crc;
++        f.store = std::make_unique<DiskKVStore>(sopts);
++    };
++    const std::size_t total = opts_.capacity_bytes;
++    const std::uint32_t main_share    = opts_.backend_page_stride ? 65U : 85U;
++    const std::uint32_t backend_share = opts_.backend_page_stride ? 25U : 0U;
++    const std::uint32_t main_denom    = 100U;
++    make_family(DiskKVKind::MainKV, opts_.main_page_stride,
++                family_budget(total, opts_.main_page_stride, main_share, main_denom));
++    make_family(DiskKVKind::BackendKV, opts_.backend_page_stride,
++                family_budget(total, opts_.backend_page_stride, backend_share, 100U));
++    // State images are large single blobs (~146 MiB each for the 48-layer GDN
++    // state). Give them a slice big enough to hold several, so a restarted
++    // multi-turn session can restore its recurrent state at a shared frontier.
++    make_family(DiskKVKind::StateImage, opts_.state_page_stride,
++                family_budget(total, opts_.state_page_stride, 100U - main_share - backend_share, 100U));
++    enabled_ = families_[0].store != nullptr;
++    if (!enabled_) {
++        throw std::invalid_argument("disk kv bridge budget too small for one main page");
++    }
++    worker_ = std::thread([this] { worker_loop(); });
++}
++
++DiskKVBridge::~DiskKVBridge() {
++    {
++        std::lock_guard<std::mutex> lock(qmu_);
++        quit_ = true;
++    }
++    qcv_.notify_all();
++    if (worker_.joinable()) { worker_.join(); }
++    // Drain whatever the worker already pulled off the queue so no page is
++    // lost between join and destruction (best effort; store is still alive).
++    while (true) {
++        SpillJob job;
++        {
++            std::lock_guard<std::mutex> lock(qmu_);
++            if (queue_.empty()) { break; }
++            job = std::move(queue_.front());
++            queue_.pop_front();
++        }
++        spill_queued(job);
++    }
++}
++
++void DiskKVBridge::wait_idle() {
++    std::unique_lock<std::mutex> lock(qmu_);
++    qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
++}
++
++void DiskKVBridge::worker_loop() {
++    while (true) {
++        SpillJob job;
++        bool have = false;
++        {
++            std::unique_lock<std::mutex> lock(qmu_);
++            qcv_.wait(lock, [this] { return quit_ || !queue_.empty(); });
++            if (quit_ && queue_.empty()) { return; }
++            if (queue_.empty()) { continue; }
++            job = std::move(queue_.front());
++            queue_.pop_front();
++            in_flight_ += 1;
++            have = true;
++        }
++        if (!have) {
++            std::lock_guard<std::mutex> lock(qmu_);
++            if (quit_) { return; }
++            continue;
++        }
++        spill_queued(job);
++        std::lock_guard<std::mutex> lock(qmu_);
++        in_flight_ -= 1;
++        qcv_.notify_all();  // wait_idle may be waiting on the queue draining
++    }
++}
++
++bool DiskKVBridge::spill_page(const DiskKVIdentity& id, DiskKVKind kind,
++                              std::span<const std::byte> bytes) {
++    if (!enabled_) { return false; }
++    const Family& f = family(kind);
++    if (f.store == nullptr || bytes.size() != f.stride) { return false; }
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (f.store->contains(id)) {
++            stats_.spill_dups += 1;
++            return true;  // already restorable; shared-prefix dedupe
++        }
++    }
++    std::lock_guard<std::mutex> lock(qmu_);
++    if (queue_.size() >= kQueueCap) {
++        std::lock_guard<std::mutex> stats_lock(mu_);
++        stats_.queue_drops += 1;
++        return false;  // backpressure: page won't be restorable (recompute later)
++    }
++    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}});
++    qcv_.notify_all();
++    return true;
++}
++
++bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
++                                   std::span<const std::byte> bytes,
++                                   std::chrono::milliseconds timeout) {
++    if (!enabled_) { return false; }
++    const Family& f = family(kind);
++    if (f.store == nullptr || bytes.size() != f.stride) { return false; }
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (f.store->contains(id)) {
++            stats_.spill_dups += 1;
++            return true;  // already restorable; shared-prefix dedupe
++        }
++    }
++    std::unique_lock<std::mutex> lock(qmu_);
++    // Bounded backpressure: the owner-death sweep must land a CONTIGUOUS
++    // chain, so wait for a free slot instead of dropping the page. The
++    // worker notifies qcv_ after every pop; on shutdown we bail out.
++    if (!qcv_.wait_for(lock, timeout, [this] { return quit_ || queue_.size() < kQueueCap; })) {
++        std::lock_guard<std::mutex> stats_lock(mu_);
++        stats_.queue_drops += 1;
++        return false;
++    }
++    if (quit_) { return false; }
++    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}});
++    qcv_.notify_all();
++    return true;
++}
++
++void DiskKVBridge::spill_queued(SpillJob& job) {
++    Family& f = family(job.kind);
++    if (f.store == nullptr || job.bytes.size() != f.stride) { return; }
++    std::vector<std::uint32_t> evicted;
++    std::span<const std::byte> bytes(job.bytes);
++    if (!f.store->upsert_page(job.id, bytes, &evicted)) { return; }
++    f.store->flush_index();  // durability point for this page
++    std::lock_guard<std::mutex> lock(mu_);
++    stats_.spills += 1;
++    stats_.spill_bytes += job.bytes.size();
++    stats_.evicted_slots += evicted.size();
++}
++
++bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
++                                   std::span<const std::byte> bytes) {
++    if (!enabled_) { return false; }
++    const Family& f = family(kind);
++    if (f.store == nullptr || bytes.size() != f.stride) { return false; }
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (f.store->contains(id)) {
++            stats_.spill_dups += 1;
++            return true;  // already restorable (dedupe)
++        }
++    }
++    std::vector<std::uint32_t> evicted;
++    if (!f.store->upsert_page(id, bytes, &evicted)) { return false; }
++    f.store->flush_index();
++    std::lock_guard<std::mutex> lock(mu_);
++    stats_.spills += 1;
++    stats_.spill_bytes += bytes.size();
++    stats_.evicted_slots += evicted.size();
++    return true;
++}
++
++bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
++                                std::span<std::byte> dst) const {
++    if (!enabled_) { return false; }
++    const Family& f = family(kind);
++    if (f.store == nullptr || dst.size() != f.stride) { return false; }
++    if (!f.store->read_page(id, dst)) {
++        std::lock_guard<std::mutex> lock(mu_);
++        stats_.restore_misses += 1;
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(mu_);
++    stats_.restores += 1;
++    stats_.restore_bytes += f.stride;
++    return true;
++}
++
++bool DiskKVBridge::contains(const DiskKVIdentity& id, DiskKVKind kind) const {
++    if (!enabled_) { return false; }
++    const Family& f = family(kind);
++    if (f.store == nullptr) { return false; }
++    return f.store->contains(id);
++}
++
++std::size_t DiskKVBridge::probe_prefix(const std::vector<DiskKVIdentity>& page_ids,
++                                       DiskKVKind kind) const {
++    if (!enabled_) { return 0; }
++    const Family& f = family(kind);
++    if (f.store == nullptr) { return 0; }
++    // Walk from page 0; the first miss stops the prefix.
++    for (std::size_t p = 0; p < page_ids.size(); ++p) {
++        if (!f.store->contains(page_ids[p])) { return p; }
++    }
++    return page_ids.size();
++}
++
++void DiskKVBridge::record_probe(std::uint32_t prompt_tokens,
++                                std::uint32_t restorable_tokens) const {
++    if (!enabled_ || restorable_tokens == 0 || opts_.base_path.empty()) { return; }
++    try {
++        const std::string path = opts_.base_path + "/diskkv_probe.jsonl";
++        std::ofstream out(path, std::ios::app);
++        if (!out) { return; }
++        out << "{\"event\":\"diskkv_probe\",\"prompt_tokens\":" << prompt_tokens
++            << ",\"restorable_tokens\":" << restorable_tokens << "}\n";
++    } catch (...) {
++    }
++}
++
++void DiskKVBridge::touch(const DiskKVIdentity& id, DiskKVKind kind) {
++    if (!enabled_) { return; }
++    const Family& f = family(kind);
++    if (f.store == nullptr) { return; }
++    f.store->touch(id);
++}
++
++std::vector<std::uint32_t> DiskKVBridge::live_state_frontiers() const {
++    std::vector<std::uint32_t> out;
++    if (!enabled_) { return out; }
++    const Family& f = family(DiskKVKind::StateImage);
++    if (f.store == nullptr) { return out; }
++    for (const DiskKVIdentity& id : f.store->live_identities()) {
++        if (id.frontier != 0) { out.push_back(id.frontier); }
++    }
++    return out;
++}
++
++DiskKVBridgeStats DiskKVBridge::stats() const {
++    std::lock_guard<std::mutex> lock(mu_);
++    return stats_;
++}
++
++std::size_t DiskKVBridge::used_bytes(DiskKVKind kind) const {
++    const Family& f = family(kind);
++    return f.store ? f.store->used_bytes() : 0;
++}
++
++std::uint32_t DiskKVBridge::slot_count(DiskKVKind kind) const {
++    const Family& f = family(kind);
++    return f.store ? f.store->slot_count() : 0;
++}
++
++const std::string& DiskKVBridge::path(DiskKVKind kind) const {
++    static const std::string kEmpty;
++    const Family& f = family(kind);
++    return f.store ? f.path : kEmpty;
++}
++
++DiskKVBridge::Family& DiskKVBridge::family(DiskKVKind kind) {
++    return families_[kind_index(kind)];
++}
++const DiskKVBridge::Family& DiskKVBridge::family(DiskKVKind kind) const {
++    return families_[kind_index(kind)];
++}
++
++} // namespace ninfer
+diff --git a/src/core/disk_kv_bridge.h b/src/core/disk_kv_bridge.h
+new file mode 100644
+index 00000000..1be4050f
+--- /dev/null
++++ b/src/core/disk_kv_bridge.h
+@@ -0,0 +1,187 @@
++#pragma once
++// Engine-facing facade over DiskKVStore (the L3 disk cold tier).
++//
++// The engine drives this with per-PAGE content identities and host byte
++// spans. One page = one slot in the store.
++//
++// Identity model (what makes this tier work):
++//   The engine maintains a rolling 128-bit digest per token frontier
++//   (PrefixShortlistDigests): digest(F) is a pure function of the first F
++//   tokens (with their positions). A KV page covering [p*64, F) is
++//   content-addressed by digest(F) — recomputable at spill time (from the
++//   live sequence) AND at restore time (from the incoming request's own
++//   digest chain) with no persistent metadata. Same content in two sessions
++//   => same digest => the second spill is an idempotent no-op (free dedupe
++//   of shared prefixes).
++//
++//   `tag` disambiguates KV produced for different engine configurations
++//   (speculative backend, proposal head, KV dtype) — identical token
++//   prefixes under a different spec backend produce different KV bytes, so
++//   the tag is part of the key, exactly like the engine's own
++//   CheckpointSummary::shortlist_key identity_tag.
++//
++//   A miss (evicted, corrupt, or never spilt) returns false and the engine
++//   falls back to exactly what it does today (recompute). Strictly
++//   better-or-equal.
++//
++// One family per KV plane: MainKV / BackendKV have different page strides,
++// so each owns its own store file.
++
++#include "core/disk_kv_store.h"
++
++#include <array>
++#include <chrono>
++#include <cstddef>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <span>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace ninfer {
++
++enum class DiskKVKind : std::uint8_t {
++    MainKV      = 0,
++    BackendKV   = 1,
++    StateImage  = 2,  // reserved: state images (GDN recurrent state)
++};
++
++/** One queued spill: identity + copied bytes. Engine copies; the bridge's
++ *  worker thread does the disk write (off the engine's hot path). */
++struct SpillJob {
++    DiskKVIdentity id;
++    DiskKVKind kind;
++    std::vector<std::byte> bytes;
++};
++
++struct DiskKVBridgeStats {
++    std::uint64_t spills          = 0;
++    std::uint64_t spill_bytes     = 0;
++    std::uint64_t spill_dups      = 0;  // identity already restorable (dedupe hit)
++    std::uint64_t restores        = 0;
++    std::uint64_t restore_bytes   = 0;
++    std::uint64_t restore_misses  = 0;
++    std::uint64_t evicted_slots   = 0;
++    std::uint64_t queue_drops     = 0;  // queue full: page lost (recompute later)
++};
++
++class DiskKVBridge {
++public:
++    struct Options {
++        std::string base_path = "";  // parent dir; per-family files <name>.diskkv
++        std::size_t main_page_stride    = 0;  // from HostKVPageLayout(MainKV)
++        std::size_t backend_page_stride = 0;  // 0 = family disabled
++        std::size_t state_page_stride   = 0;  // 0 = family disabled
++        // Total spill budget; split across ENABLED families 85/15 (main dominates).
++        std::size_t capacity_bytes = 0;  // 0 = disabled
++        bool verify_crc = true;
++    };
++
++    /** Open (create) the per-family backing files. Throws on failure. */
++    explicit DiskKVBridge(Options opts);
++    ~DiskKVBridge();
++
++    DiskKVBridge(const DiskKVBridge&)            = delete;
++    DiskKVBridge& operator=(const DiskKVBridge&) = delete;
++
++    [[nodiscard]] bool enabled() const noexcept { return enabled_; }
++
++    /** Spill one page. The bytes are copied into a bounded queue and written
++     *  by a background thread: the caller only pays one memcpy (host pages
++     *  are released by the engine right after this call, so synchronous disk
++     *  IO would stall the pressure/eviction path for seconds). Returns true
++     *  if the page is queued (or already restorable); false if the family is
++     *  disabled or the queue is full (restore will fall back to recompute). */
++    bool spill_page(const DiskKVIdentity& id, DiskKVKind kind, std::span<const std::byte> bytes);
++
++    /** Backpressure-aware spill for the owner-death path: waits up to
++     *  `timeout` for a free queue slot instead of dropping the page. A dropped
++     *  page breaks the contiguous prefix chain (restore walks from 0 and stops
++     *  at the first miss), costing a full recompute. Returns true if queued
++     *  (or already restorable); false on timeout / disabled / shutdown. */
++    bool spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
++                         std::span<const std::byte> bytes, std::chrono::milliseconds timeout);
++
++    /** Synchronous spill: write the bytes to the store on the calling thread
++     *  (no async queue copy). For large blobs (state images ~146 MiB) where
++     *  buffering a copy in the bounded queue would exhaust memory. The caller
++     *  must ensure `bytes` outlives this call (it is read directly). Returns
++     *  true if restorable after the call (fresh write or dedupe hit). */
++    bool spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
++                         std::span<const std::byte> bytes);
++
++    /** Wait until all queued spill jobs have been applied. Test/diagnostics. */
++    void wait_idle();
++
++    /** Read one previously spilt page into `dst` (family stride bytes).
++     *  Synchronous (reads on the calling thread; the async queue is spill-only),
++     *  so the read-side restore never waits on the background writer. Returns
++     *  false on miss/evict/corrupt -> caller recomputes. */
++    [[nodiscard]] bool restore_page(const DiskKVIdentity& id, DiskKVKind kind,
++                                    std::span<std::byte> dst) const;
++
++    /** True if this identity's page is restorable on disk right now. Cheap
++     *  (header check). */
++    [[nodiscard]] bool contains(const DiskKVIdentity& id, DiskKVKind kind) const;
++
++    /** Read-only benefit probe: longest contiguous prefix (from page 0) of
++     *  `page_ids` that is restorable now. Admission-time Root-path requests
++     *  use this to measure how much recompute the tier COULD save. */
++    [[nodiscard]] std::size_t probe_prefix(const std::vector<DiskKVIdentity>& page_ids,
++                                           DiskKVKind kind) const;
++
++    /** Append one probe record as a JSONL line next to the disk files. */
++    void record_probe(std::uint32_t prompt_tokens, std::uint32_t restorable_tokens) const;
++
++    /** Refresh LRU position after a successful restore. */
++    void touch(const DiskKVIdentity& id, DiskKVKind kind);
++
++    /** Frontiers of every live StateImage page (the state image at frontier E
++     *  is keyed digest(E) — the same key as the partial tail KV page at E, so
++     *  a restorable boundary is exactly a live state frontier whose digest the
++     *  incoming request's own chain also produces). Empty when the state family
++     *  is disabled. */
++    [[nodiscard]] std::vector<std::uint32_t> live_state_frontiers() const;
++
++    [[nodiscard]] DiskKVBridgeStats stats() const;
++    [[nodiscard]] std::size_t used_bytes(DiskKVKind kind) const;
++    [[nodiscard]] std::uint32_t slot_count(DiskKVKind kind) const;
++    [[nodiscard]] const std::string& path(DiskKVKind kind) const;
++
++private:
++    struct Family {
++        std::unique_ptr<DiskKVStore> store;
++        std::size_t stride = 0;
++        std::string path;
++    };
++
++    void worker_loop();
++    /** Apply one queued job to the store (worker thread / destructor drain). */
++    void spill_queued(SpillJob& job);
++
++    Family& family(DiskKVKind kind);
++    const Family& family(DiskKVKind kind) const;
++    [[nodiscard]] static std::uint32_t kind_index(DiskKVKind kind) {
++        return static_cast<std::uint32_t>(kind);
++    }
++
++    Options opts_;
++    bool    enabled_ = false;
++    Family families_[3];
++    mutable std::mutex mu_;   // guards stats (stores are self-locked)
++    mutable DiskKVBridgeStats stats_;
++    // Bounded async spill queue + writer thread.
++    std::mutex qmu_;
++    std::condition_variable qcv_;
++    std::deque<SpillJob> queue_;
++    std::thread worker_;
++    bool quit_ = false;
++    std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied
++    static constexpr std::size_t kQueueCap = 512;  // ~780 MiB in flight at 1.5 MiB/page
++};
++
++} // namespace ninfer
+diff --git a/src/core/disk_kv_store.cpp b/src/core/disk_kv_store.cpp
+new file mode 100644
+index 00000000..e2244a99
+--- /dev/null
++++ b/src/core/disk_kv_store.cpp
+@@ -0,0 +1,450 @@
++#include "core/disk_kv_store.h"
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <stdexcept>
++#include <system_error>
++
++namespace ninfer {
++namespace {
++
++constexpr std::size_t kAlignment = 4096;
++constexpr std::size_t kTrailerSize = 128;
++
++std::size_t round_up(std::size_t v, std::size_t a) { return (v + (a - 1)) & ~(a - 1); }
++
++std::string index_path(const std::string& data_path) {
++    return data_path + ".idx";
++}
++
++struct CrcTable {
++    std::array<std::uint32_t, 256> t{};
++    CrcTable() {
++        for (std::uint32_t i = 0; i < 256; ++i) {
++            std::uint32_t c = i;
++            for (int k = 0; k < 8; ++k) {
++                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
++            }
++            t[i] = c;
++        }
++    }
++};
++const CrcTable& crc_table() {
++    static const CrcTable tbl;
++    return tbl;
++}
++
++} // namespace
++
++std::uint64_t DiskKVStore::crc32c(std::span<const std::byte> data) {
++    const auto& tbl = crc_table();
++    std::uint32_t c = 0xFFFFFFFFu;
++    for (const std::byte b : data) {
++        const std::uint8_t v = static_cast<std::uint8_t>(b);
++        c = tbl.t[(c ^ v) & 0xFFu] ^ (c >> 8);
++    }
++    return static_cast<std::uint64_t>(c ^ 0xFFFFFFFFu);
++}
++
++// ---------- layout ----------
++
++std::size_t DiskKVStore::slot_bytes() const noexcept {
++    return round_up(kSlotHeaderSize + opts_.slot_size, kAlignment);
++}
++std::size_t DiskKVStore::data_bytes() const noexcept {
++    return static_cast<std::size_t>(max_slots_) * slot_bytes();
++}
++std::size_t DiskKVStore::trailer_off() const noexcept {
++    return round_up(data_bytes(), kAlignment);
++}
++std::size_t DiskKVStore::page_off(std::uint32_t slot) const noexcept {
++    return static_cast<std::size_t>(slot) * slot_bytes() + kSlotHeaderSize;
++}
++DiskKVStore::Header* DiskKVStore::slot_hdr(std::uint32_t slot) const {
++    return reinterpret_cast<Header*>(base_ + static_cast<std::size_t>(slot) * slot_bytes());
++}
++const DiskKVStore::Header* DiskKVStore::slot_hdr_c(std::uint32_t slot) const {
++    return reinterpret_cast<const Header*>(base_ + static_cast<std::size_t>(slot) * slot_bytes());
++}
++
++// ---------- lifecycle ----------
++
++DiskKVStore::DiskKVStore(Options opts) : opts_(std::move(opts)) {
++    if (opts_.path.empty()) { throw std::invalid_argument("disk kv store path is empty"); }
++    if (opts_.slot_size < kSlotHeaderSize) {
++        throw std::invalid_argument("disk kv store slot_size too small");
++    }
++    if (opts_.max_slots == 0) {
++        if (opts_.capacity_bytes == 0) {
++            throw std::invalid_argument("disk kv store needs max_slots or capacity_bytes");
++        }
++        opts_.max_slots = static_cast<std::uint32_t>(
++            opts_.capacity_bytes / round_up(kSlotHeaderSize + opts_.slot_size, kAlignment));
++        if (opts_.max_slots == 0) { throw std::invalid_argument("capacity too small"); }
++    }
++    max_slots_ = opts_.max_slots;
++    slot_pitch_ = slot_bytes();
++    file_bytes_ = trailer_off() + kTrailerSize;
++
++    struct stat st{};
++    const bool data_exists = (::stat(opts_.path.c_str(), &st) == 0 && st.st_size > 0);
++    if (!data_exists) {
++        create_fresh();
++    } else {
++        if (static_cast<std::size_t>(st.st_size) < file_bytes_) {
++            throw std::runtime_error("disk kv store " + opts_.path +
++                                     " smaller than required by current geometry");
++        }
++        // Open the EXISTING file: never truncate.
++        fd_ = ::open(opts_.path.c_str(), O_RDWR, 0644);
++        if (fd_ < 0) {
++            throw std::runtime_error(std::string("open failed: ") + std::strerror(errno));
++        }
++        void* mapped = ::mmap(nullptr, file_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
++        if (mapped == MAP_FAILED) {
++            const int e = errno;
++            ::close(fd_); fd_ = -1;
++            throw std::runtime_error(std::string("mmap failed: ") + std::strerror(e));
++        }
++        base_ = static_cast<std::byte*>(mapped);
++    }
++    for (std::uint32_t s = 0; s < max_slots_; ++s) { free_slots_.push_back(s); }
++
++    if (!load_index()) {
++        rebuild_from_scan();
++    }
++}
++
++void DiskKVStore::create_fresh() {
++    fd_ = ::open(opts_.path.c_str(), O_RDWR | O_CREAT, 0644);
++    if (fd_ < 0) {
++        throw std::runtime_error(std::string("open failed: ") + std::strerror(errno));
++    }
++    if (::ftruncate(fd_, static_cast<off_t>(file_bytes_)) != 0) {
++        const int e = errno;
++        ::close(fd_); fd_ = -1;
++        throw std::runtime_error(std::string("ftruncate failed: ") + std::strerror(e));
++    }
++    void* mapped = ::mmap(nullptr, file_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
++    if (mapped == MAP_FAILED) {
++        const int e = errno;
++        ::close(fd_); fd_ = -1;
++        throw std::runtime_error(std::string("mmap failed: ") + std::strerror(e));
++    }
++    base_ = static_cast<std::byte*>(mapped);
++}
++
++DiskKVStore::~DiskKVStore() {
++    if (base_ != nullptr) {
++        ::munmap(base_, file_bytes_);
++        base_ = nullptr;
++    }
++    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
++}
++
++// ---------- index persistence ----------
++
++bool DiskKVStore::load_index() {
++    const std::string path = index_path(opts_.path);
++    FILE* f = std::fopen(path.c_str(), "rb");
++    if (f == nullptr) { return false; }  // no index yet: caller rebuilds
++    IdxHeader hdr{};
++    if (std::fread(&hdr, sizeof(hdr), 1, f) != 1 ||
++        hdr.magic != IdxHeader::kMagic ||
++        hdr.slot_size != static_cast<std::uint32_t>(slot_bytes()) ||
++        hdr.max_slots != max_slots_) {
++        std::fclose(f);
++        return false;  // foreign/corrupt index: caller rebuilds
++    }
++    std::vector<IdxEntry> rows(hdr.count);
++    if (hdr.count > 0 &&
++        std::fread(rows.data(), sizeof(IdxEntry), hdr.count, f) != hdr.count) {
++        std::fclose(f);
++        return false;
++    }
++    std::fclose(f);
++
++    index_.clear();
++    index_.reserve(hdr.count);
++    free_slots_.clear();
++    free_slots_.reserve(max_slots_);
++    std::uint32_t occupied = 0;
++    for (const IdxEntry& r : rows) {
++        if (r.slot >= max_slots_) { continue; }  // defensive: ignore bad row
++        const Header& h = *slot_hdr_c(r.slot);
++        const DiskKVIdentity id{r.lo, r.hi, r.tag, r.frontier};
++        // Header-only check (cheap): the index row must agree with the slot
++        // header. If the slot was repurposed (different identity), drop the
++        // row. Data integrity is verified lazily at READ time (read_page
++        // CRC) — a corrupted page becomes a restore miss, not a startup cost.
++        if (h.magic != Header::kMagic || h.lo != id.lo || h.hi != id.hi ||
++            h.tag != id.tag || h.frontier != id.frontier) {
++            continue;
++        }
++        index_[id] = r.slot;
++        if (h.last_used > clock_) { clock_ = h.last_used; }
++    }
++    // Rebuild the free pool from the (verified) live slots.
++    std::vector<bool> live(max_slots_, false);
++    for (const auto& [id, s] : index_) { live[s] = true; }
++    for (std::uint32_t s = 0; s < max_slots_; ++s) {
++        if (!live[s]) { free_slots_.push_back(s); }
++    }
++    (void)occupied;
++    return true;
++}
++
++void DiskKVStore::rebuild_from_scan() {
++    index_.clear();
++    free_slots_.clear();
++    free_slots_.reserve(max_slots_);
++    clock_ = 0;
++    std::vector<bool> live(max_slots_, false);
++    for (std::uint32_t s = 0; s < max_slots_; ++s) {
++        const Header& h = *slot_hdr_c(s);
++        if (h.magic != Header::kMagic) { continue; }
++        const std::uint64_t crc =
++            crc32c(std::span<const std::byte>(base_ + page_off(s), opts_.slot_size));
++        if (crc != h.crc) { continue; }  // torn/corrupt slot: dead
++        const DiskKVIdentity id{h.lo, h.hi, h.tag, h.frontier};
++        index_[id] = s;
++        live[s] = true;
++        if (h.last_used > clock_) { clock_ = h.last_used; }
++    }
++    for (std::uint32_t s = 0; s < max_slots_; ++s) {
++        if (!live[s]) { free_slots_.push_back(s); }
++    }
++    rebuilt_from_scan_ = true;
++    persist_index_unlocked();
++}
++
++void DiskKVStore::persist_index_unlocked() {
++    // Atomic: write a tmp file, fsync, rename over the index path.
++    const std::string path = index_path(opts_.path);
++    const std::string tmp  = path + ".tmp";
++    FILE* f = std::fopen(tmp.c_str(), "wb");
++    if (f == nullptr) { return; }
++    IdxHeader hdr{};
++    hdr.magic     = IdxHeader::kMagic;
++    hdr.version   = 1;
++    hdr.count     = static_cast<std::uint32_t>(index_.size());
++    hdr.slot_size = static_cast<std::uint32_t>(slot_bytes());
++    hdr.max_slots = max_slots_;
++    hdr.clock     = clock_;
++    std::fwrite(&hdr, sizeof(hdr), 1, f);
++    std::fseek(f, 0, SEEK_END);
++    const std::size_t total = (std::size_t)ftell(f) + index_.size() * sizeof(IdxEntry);
++    for (const auto& [id, s] : index_) {
++        IdxEntry r{};
++        r.lo = id.lo;
++        r.hi = id.hi;
++        r.tag = id.tag;
++        r.frontier = id.frontier;
++        r.slot = s;
++        std::fwrite(&r, sizeof(r), 1, f);
++    }
++    std::fflush(f);
++    std::fclose(f);
++    // Deliberately NO fsync on the hot path: a torn index is recovered by a
++    // full header rescan on next open (cheap: slots are CRC-verified), and
++    // the spill worker would otherwise stall behind fsync latency per page.
++    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
++        ::unlink(tmp.c_str());
++        return;
++    }
++}
++
++// ---------- internals ----------
++
++std::uint64_t DiskKVStore::bump_clock() noexcept {
++    return ++clock_;
++}
++
++void DiskKVStore::zero_slot(std::uint32_t slot) {
++    std::memset(slot_hdr(slot), 0, sizeof(Header));
++}
++
++void DiskKVStore::record_live(const DiskKVIdentity& id, std::uint32_t slot, std::uint64_t last_used) {
++    index_[id] = slot;
++    if (last_used > clock_) { clock_ = last_used; }
++}
++
++void DiskKVStore::release_slot(std::uint32_t slot) {
++    free_slots_.push_back(slot);
++}
++
++std::optional<DiskKVStore::EvictedPage> DiskKVStore::evict_one_lru() {
++    // Caller holds mu_. Lowest last_used wins; ties broken by slot index.
++    const Header* victim_hdr = nullptr;
++    std::uint32_t victim_slot = 0;
++    bool found = false;
++    for (const auto& [id, s] : index_) {
++        const Header& h = *slot_hdr_c(s);
++        if (!found || h.last_used < victim_hdr->last_used ||
++            (h.last_used == victim_hdr->last_used && s < victim_slot)) {
++            victim_hdr = &h;
++            victim_slot = s;
++            found = true;
++        }
++    }
++    if (!found) { return std::nullopt; }
++    const EvictedPage victim{DiskKVIdentity{victim_hdr->lo, victim_hdr->hi, victim_hdr->tag,
++                                             victim_hdr->frontier},
++                             victim_slot};
++    index_.erase(victim.id);
++    zero_slot(victim_slot);
++    release_slot(victim_slot);
++    return victim;
++}
++
++bool DiskKVStore::identity_matches(const Header& h, const DiskKVIdentity& id) const {
++    return h.lo == id.lo && h.hi == id.hi && h.tag == id.tag && h.frontier == id.frontier;
++}
++
++// ---------- API ----------
++
++std::uint32_t DiskKVStore::live_slots() const noexcept {
++    return static_cast<std::uint32_t>(index_.size());
++}
++std::size_t DiskKVStore::used_bytes() const noexcept {
++    return index_.size() * slot_pitch_;
++}
++std::size_t DiskKVStore::free_bytes() const noexcept {
++    return static_cast<std::size_t>(max_slots_ - live_slots()) * slot_pitch_;
++}
++
++bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
++                             std::vector<std::uint32_t>* evicted) {
++    if (bytes.size() != opts_.slot_size || max_slots_ == 0) { return false; }
++    std::lock_guard<std::mutex> lock(mu_);
++
++    const auto it = index_.find(id);
++    if (it != index_.end()) {
++        // Already restorable: refresh LRU in memory (flushed by flush_index).
++        (*slot_hdr(it->second)).last_used = bump_clock();
++        return true;
++    }
++
++    std::uint32_t slot = 0;
++    if (!free_slots_.empty()) {
++        slot = free_slots_.back();
++        free_slots_.pop_back();
++    } else {
++        // Full: LRU-evict the coldest page.
++        auto victim = evict_one_lru();
++        if (!victim.has_value()) { return false; }
++        if (evicted != nullptr) {
++            evicted->push_back(victim->slot);
++        }
++        // evict_one_lru() already released the victim slot into free_slots_.
++        slot = free_slots_.back();
++        free_slots_.pop_back();
++    }
++
++    // Write page bytes, then stamp the header LAST (magic makes it live).
++    std::memcpy(base_ + page_off(slot), bytes.data(), opts_.slot_size);
++    Header nh{};
++    nh.magic     = Header::kMagic;
++    nh.lo        = id.lo;
++    nh.hi        = id.hi;
++    nh.tag       = id.tag;
++    nh.frontier  = id.frontier;
++    nh.crc       = static_cast<std::uint32_t>(crc32c(
++                       std::span<const std::byte>(base_ + page_off(slot), opts_.slot_size)));
++    nh.last_used = bump_clock();
++    std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
++    record_live(id, slot, nh.last_used);
++    // Structural change (new live page / eviction): persist NOW so the page
++    // is discoverable across a crash. LRU-only changes are lazy.
++    persist_index_unlocked();
++    return true;
++}
++
++bool DiskKVStore::read_page(const DiskKVIdentity& id, std::span<std::byte> dst) {
++    if (dst.size() != opts_.slot_size) { return false; }
++    std::lock_guard<std::mutex> lock(mu_);
++    const auto it = index_.find(id);
++    if (it == index_.end()) { return false; }
++    const std::uint32_t slot = it->second;
++    const Header& h = *slot_hdr_c(slot);
++    if (h.magic != Header::kMagic || !identity_matches(h, id)) { return false; }
++    const std::size_t off = page_off(slot);
++    if (opts_.verify_crc) {
++        const std::uint64_t crc = crc32c(std::span<const std::byte>(base_ + off, opts_.slot_size));
++        if (crc != h.crc) { return false; }
++    }
++    std::memcpy(dst.data(), base_ + off, opts_.slot_size);
++    // Read counts as use: refresh LRU in memory (lazy persist).
++    (*slot_hdr(slot)).last_used = bump_clock();
++    return true;
++}
++
++bool DiskKVStore::contains(const DiskKVIdentity& id) const {
++    std::lock_guard<std::mutex> lock(mu_);
++    return index_.find(id) != index_.end();
++}
++
++void DiskKVStore::flush_index() {
++    std::lock_guard<std::mutex> lock(mu_);
++    persist_index_unlocked();
++}
++
++bool DiskKVStore::touch(const DiskKVIdentity& id) {
++    std::lock_guard<std::mutex> lock(mu_);
++    const auto it = index_.find(id);
++    if (it == index_.end()) { return false; }
++    (*slot_hdr(it->second)).last_used = bump_clock();
++    return true;
++}
++
++bool DiskKVStore::evict(const DiskKVIdentity& id) {
++    std::lock_guard<std::mutex> lock(mu_);
++    const auto it = index_.find(id);
++    if (it == index_.end()) { return false; }
++    const std::uint32_t slot = it->second;
++    index_.erase(it);
++    zero_slot(slot);
++    release_slot(slot);
++    persist_index_unlocked();
++    return true;
++}
++
++std::vector<DiskKVIdentity> DiskKVStore::evict_until_free(std::uint32_t free) {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<DiskKVIdentity> gone;
++    while (index_.size() + free_slots_.size() < max_slots_ &&
++           free_slots_.size() < free) {
++        auto v = evict_one_lru();
++        if (!v.has_value()) { break; }
++        gone.push_back(v->id);
++    }
++    if (!gone.empty()) { persist_index_unlocked(); }
++    return gone;
++}
++
++std::vector<DiskKVIdentity> DiskKVStore::live_identities() const {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<DiskKVIdentity> out;
++    out.reserve(index_.size());
++    for (const auto& [id, s] : index_) { (void)s; out.push_back(id); }
++    return out;
++}
++
++std::vector<std::uint32_t> DiskKVStore::live_slot_list() const {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<std::uint32_t> out;
++    out.reserve(index_.size());
++    for (const auto& [id, s] : index_) { out.push_back(s); }
++    return out;
++}
++
++} // namespace ninfer
+diff --git a/src/core/disk_kv_store.h b/src/core/disk_kv_store.h
+new file mode 100644
+index 00000000..99bffb16
+--- /dev/null
++++ b/src/core/disk_kv_store.h
+@@ -0,0 +1,198 @@
++#pragma once
++// L3 (disk) tier for the KV cache hierarchy — persistent, self-describing,
++// true-LRU.
++//
++// NInfer's cache is two levels: a device page pool (kv-capacity tokens) and a
++// pinned host arena (--host-kv-mib). When the host arena fills, the pressure
++// planner used to DROP the affected checkpoints permanently, so the next turn
++// of that session paid full prefill recompute. This store is a cold,
++// file-backed third level: a host-full event demotes a page run to disk, and
++// a later turn restores it (disk read + H2D) instead of recomputing.
++//
++// PERSISTENCE MODEL (engine restarts happen — watchdog + manual; data that
++// dies with the process is worth nothing):
++//   * DATA file: 4KiB-aligned slots, each with a 48-byte SELF-DESCRIBING
++//     header (magic + content identity + CRC32C + LRU timestamp). Slot
++//     placement is managed by the store (free pool), NOT by a hash of the
++//     identity — identity->slot lives in the index.
++//   * INDEX file (<path>.idx): the identity->slot mapping, rewritten
++//     atomically (tmp + fsync + rename) whenever the live set changes.
++//   * Open: valid index -> fast path. Missing/corrupt index -> rebuild by
++//     scanning slot headers (slow, one-time; CRC-verified).
++//
++// EVICTION: true LRU over the live set (lowest last_used first). Reads and
++// explicit touches refresh last_used, so an active session's pages outlive
++// the coldest sessions'.
++//
++// Self-contained (no CUDA, no engine types): builds and unit-tests in seconds.
++
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <optional>
++#include <span>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace ninfer {
++
++/** Content identity of one KV page (mirrors the engine's prefix digest). */
++struct DiskKVIdentity {
++    std::uint64_t lo       = 0;  // rolling digest of the prefix at the page end
++    std::uint64_t hi       = 0;
++    std::uint32_t tag      = 0;  // engine identity_tag (spec backend | proposal<<8 | dtype<<16)
++    std::uint32_t frontier = 0;  // page end token position (observability)
++
++    [[nodiscard]] bool operator==(const DiskKVIdentity&) const noexcept = default;
++};
++
++struct DiskKVIdentityHash {
++    std::size_t operator()(const DiskKVIdentity& id) const noexcept {
++        std::uint64_t h = id.lo;
++        h ^= id.hi + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
++        h ^= std::uint64_t(id.tag) * 0xff51afd7ed558ccdULL;
++        h ^= std::uint64_t(id.frontier) * 0xc4ceb9fe1a85ec53ULL;
++        h ^= h >> 31;
++        h *= 0xff51afd7ed558ccdULL;
++        h ^= h >> 33;
++        return static_cast<std::size_t>(h);
++    }
++};
++
++class DiskKVStore {
++public:
++    struct Options {
++        std::string path;         // data file (created if absent; NEVER truncated)
++        std::size_t slot_size    = 0;   // bytes per KV page (engine page stride)
++        std::size_t capacity_bytes = 0; // 0 = invalid (one of the two is required)
++        std::uint32_t max_slots   = 0;  // explicit capacity (preferred)
++        bool verify_crc          = true;
++    };
++
++    /** Open the backing file and the identity index. Throws on I/O errors or
++     *  a data file laid out for a different geometry. */
++    explicit DiskKVStore(Options opts);
++    ~DiskKVStore();
++
++    DiskKVStore(const DiskKVStore&)            = delete;
++    DiskKVStore& operator=(const DiskKVStore&) = delete;
++
++    [[nodiscard]] std::size_t    slot_size()  const noexcept { return opts_.slot_size; }
++    [[nodiscard]] std::uint32_t  slot_count() const noexcept { return max_slots_; }
++    [[nodiscard]] std::uint32_t  live_slots() const noexcept;
++    [[nodiscard]] std::size_t    used_bytes() const noexcept;
++    [[nodiscard]] std::size_t    free_bytes() const noexcept;
++    [[nodiscard]] const std::string& path() const noexcept { return opts_.path; }
++    [[nodiscard]] bool            index_rebuilt_from_scan() const noexcept { return rebuilt_from_scan_; }
++
++    /** Insert (or refresh) the page. When the store is full, evicts the
++     *  LRU page first (its id reported via `evicted`, may be null).
++     *  Returns false only when the store is full and no slot was evictable. */
++    bool upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
++                     std::vector<std::uint32_t>* evicted = nullptr);
++
++    /** Read the page into `dst` (slot_size bytes). Identity + CRC verified;
++     *  refreshes the LRU timestamp. */
++    bool read_page(const DiskKVIdentity& id, std::span<std::byte> dst);
++
++    /** Presence check (cheap; no data read, no LRU refresh). */
++    [[nodiscard]] bool contains(const DiskKVIdentity& id) const;
++
++    /** Refresh the slot's LRU timestamp without reading the page. */
++    bool touch(const DiskKVIdentity& id);
++
++    /** Evict a specific page (if it currently holds `id`). */
++    bool evict(const DiskKVIdentity& id);
++
++    /** LRU-evict until `free` slots are free. Returns evicted identities. */
++    [[nodiscard]] std::vector<DiskKVIdentity> evict_until_free(std::uint32_t free);
++
++    /** Identities of every live page in this store (read-side frontier scan:
++     *  the engine matches its own digest chain against each live state
++     *  frontier to find a restorable boundary). Bounded by max_slots. */
++    [[nodiscard]] std::vector<DiskKVIdentity> live_identities() const;
++
++    /** Slot indices currently live (diagnostics). */
++    [[nodiscard]] std::vector<std::uint32_t> live_slot_list() const;
++
++    /** Public durability point (worker thread / tests): persist pending
++     *  in-memory LRU/index changes to the index file. */
++    void flush_index();
++
++    static constexpr std::size_t kSlotHeaderSize = 48;
++    static std::uint64_t crc32c(std::span<const std::byte> data);
++
++private:
++    struct Header {  // on-disk, 48 bytes, head of every slot
++        std::uint32_t magic     = 0;
++        std::uint32_t reserved  = 0;
++        std::uint64_t last_used = 0;
++        std::uint64_t lo        = 0;
++        std::uint64_t hi        = 0;
++        std::uint32_t tag       = 0;
++        std::uint32_t frontier  = 0;
++        std::uint32_t crc       = 0;
++        std::uint32_t pad       = 0;
++        static constexpr std::uint32_t kMagic = 0x4E44564B;  // 'NKVD'
++    };
++
++    struct IdxEntry {  // on-disk index row, 32 bytes
++        std::uint64_t lo       = 0;
++        std::uint64_t hi       = 0;
++        std::uint32_t tag      = 0;
++        std::uint32_t frontier = 0;
++        std::uint32_t slot     = 0;
++        std::uint32_t pad      = 0;
++    };
++
++    struct IdxHeader {  // on-disk index header, 32 bytes
++        std::uint32_t magic   = 0;  // 'KDVI'
++        std::uint32_t version = 0;
++        std::uint32_t count   = 0;
++        std::uint32_t slot_size = 0;
++        std::uint32_t max_slots = 0;
++        std::uint64_t clock   = 0;  // LRU timestamp base, survives restarts
++        static constexpr std::uint32_t kMagic = 0x4944564B;
++    };
++
++    [[nodiscard]] std::size_t slot_bytes() const noexcept;
++    [[nodiscard]] std::size_t data_bytes() const noexcept;
++    [[nodiscard]] std::size_t trailer_off() const noexcept;
++    [[nodiscard]] std::size_t page_off(std::uint32_t slot) const noexcept;
++    [[nodiscard]] Header* slot_hdr(std::uint32_t slot) const;
++    [[nodiscard]] const Header* slot_hdr_c(std::uint32_t slot) const;
++    [[nodiscard]] bool identity_matches(const Header& h, const DiskKVIdentity& id) const;
++
++    void create_fresh();
++    bool load_index();                    // fast path; false -> caller rebuilds
++    void rebuild_from_scan();             // slow path: scan all slot headers
++    /** Rewrite the index file atomically (tmp+rename, no fsync on hot path).
++     *  A torn index is safe: next open falls back to a header rescan. */
++    void persist_index_unlocked();
++    std::uint64_t bump_clock() noexcept;
++    void zero_slot(std::uint32_t slot);
++    void record_live(const DiskKVIdentity& id, std::uint32_t slot, std::uint64_t last_used);
++    void release_slot(std::uint32_t slot);
++    struct EvictedPage {
++        DiskKVIdentity id;
++        std::uint32_t slot;
++    };
++    /** LRU core: evict the lowest-last_used live slot. Caller holds mu_. */
++    std::optional<EvictedPage> evict_one_lru();
++
++    mutable std::mutex mu_;
++    Options      opts_;
++    int          fd_         = -1;
++    std::byte*   base_       = nullptr;
++    std::size_t  file_bytes_ = 0;
++    std::size_t  slot_pitch_ = 0;
++    std::uint32_t max_slots_ = 0;
++    std::uint64_t clock_     = 0;
++    bool         rebuilt_from_scan_ = false;
++
++    std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
++    std::vector<std::uint32_t> free_slots_;
++};
++
++} // namespace ninfer
+diff --git a/src/runtime/contract/types.h b/src/runtime/contract/types.h
+index 010dbad7..0d2e1c6a 100644
+--- a/src/runtime/contract/types.h
++++ b/src/runtime/contract/types.h
+@@ -160,6 +160,8 @@ struct ResolvedExecutionOptions {
+     std::uint32_t requested_output_tokens = 0;
+     bool allow_prefix_reuse               = true;
+     ThinkingControlOptions thinking;
++    // Top-K next-token probability export (see ninfer::RequestOptions::top_logprobs).
++    std::optional<std::uint32_t> top_logprobs;
+ };
+ 
+ struct ResolvedRequestOptions {
+@@ -600,6 +602,10 @@ struct PrefillStepResult {
+     std::uint32_t processed_prompt_tokens = 0;
+     bool complete                         = false;
+     ExecutionTiming timing;
++    // Exported only on the completing prefill step when the request asked for next-token
++    // probabilities (resolved top_logprobs): the exact full-vocabulary top-K of the first
++    // generated token. Absent for non-completing steps and requests without the export.
++    std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
+ };
+ 
+ struct RoundBudget {
+diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
+index ee15cf8a..8a062dbc 100644
+--- a/src/runtime/engine/engine.cpp
++++ b/src/runtime/engine/engine.cpp
+@@ -57,6 +57,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+         cache.max_private_continuations         = concurrency;
+         cache.max_shared_prefixes               = 0;
+         cache.max_long_anchors_per_continuation = 0;
++        cache.rolling_retention                 = false;
+         return options;
+     }
+ 
+@@ -108,6 +109,13 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
+     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
+     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+     resolved.execution.thinking                = options.execution.thinking;
++    if (options.top_logprobs && *options.top_logprobs == 0) {
++        throw std::invalid_argument("top_logprobs must be positive");
++    }
++    if (options.top_logprobs && *options.top_logprobs > 100) {
++        throw std::invalid_argument("top_logprobs must be in [1,100]");
++    }
++    resolved.execution.top_logprobs            = options.top_logprobs;
+     resolved.stop                              = std::move(options.stop);
+     resolved.output                            = options.output;
+     return resolved;
+@@ -336,6 +344,16 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
+         impl_->active);
+ }
+ 
++std::string Engine::decode_token(std::uint32_t token_id) const {
++    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
++    return std::visit(
++        [&](const auto& target_ptr) {
++            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
++            return target_ptr->loaded->frontend.decode_token(token_id);
++        },
++        impl_->active);
++}
++
+ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
+                                   static_cast<std::uint64_t>(tokens.size()));
+diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
+index d4d9b2d6..c3d0e201 100644
+--- a/src/runtime/engine/engine_core.h
++++ b/src/runtime/engine/engine_core.h
+@@ -81,6 +81,7 @@ public:
+             !options.context_cache.max_shared_prefixes) {
+             throw std::logic_error("target admission capacity does not match the Engine");
+         }
++        if (options.context_cache.rolling_retention) { resources_.enable_rolling_retention(); }
+         std::promise<void> startup;
+         std::future<void> started = startup.get_future();
+         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+@@ -861,6 +862,7 @@ private:
+         result.timings                 = request->generation_timings;
+         result.timings.prepare_seconds = request->prepare_seconds;
+         result.speculative             = std::move(request->speculative_stats);
++        result.next_token_top_logprobs = std::move(request->next_token_top_logprobs);
+         result.thinking                = request->output.thinking_stats();
+         result.materialization         = request->materialization_diagnostics;
+         if (request->first_token) {
+@@ -1371,6 +1373,7 @@ private:
+             request_admission_check();
+         }
+         request->begin = progress.summary;
++        request->next_token_top_logprobs = std::move(progress.next_token_top_logprobs);
+         const std::array<std::uint32_t, 1> lanes{lane};
+         phase.finish();
+         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
+diff --git a/src/runtime/engine/request_record.h b/src/runtime/engine/request_record.h
+index 4def8a67..89de8b57 100644
+--- a/src/runtime/engine/request_record.h
++++ b/src/runtime/engine/request_record.h
+@@ -190,6 +190,9 @@ struct RequestRecord {
+     RequestHostTiming host_timing;
+     SpeculativeStats speculative_stats;
+     MaterializationDiagnostics materialization_diagnostics;
++    // Next-token top-K export for this request (see ResolvedExecutionOptions::top_logprobs);
++    // filled by the completing prefill step and copied into the final GenerationResult.
++    std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
+ 
+     std::mutex mutex;
+     std::condition_variable cv;
+diff --git a/src/runtime/engine/resource_manager.h b/src/runtime/engine/resource_manager.h
+index f14837e2..1368e361 100644
+--- a/src/runtime/engine/resource_manager.h
++++ b/src/runtime/engine/resource_manager.h
+@@ -769,7 +769,8 @@ public:
+                             : std::optional<PlanningOwnerId>(owner_id_for(
+                                   LogicalOwnerKind::SharedPrefix, scenario.publication_slot)),
+                     .candidate_demand_mask =
+-                        committed_demand_mask_for(scenario.assessment.shortlist_key),
++                        committed_demand_mask_for(scenario.assessment.shortlist_key) |
++                        rolling_inherited_demand(lane),
+                     .candidate_rebuild_ns =
+                         cost_model_.prefill_ns(scenario.assessment.protected_rebuild_work),
+                     .private_baseline_immediate_ns = price_context_transfer_requirements(
+@@ -1112,6 +1113,30 @@ public:
+                                            : static_cast<std::uint32_t>(shared_references);
+     }
+ 
++    // Opt in to rolling retention. See ContextCacheOptions::rolling_retention.
++    void enable_rolling_retention() noexcept { rolling_retention_ = true; }
++
++    // Rolling retention: the demand a capture inherits from the residents the current request
++    // has proven it extends. A request's committed demand record lists every resident key it
++    // matched exactly at that resident's frontier; the capture at the prompt's end frontier is
++    // therefore a strict extension of each. In a monotonic conversation every past request that
++    // wanted an ancestor wants its descendant next, so the ancestor's demand is the descendant's.
++    // A capture that matched nothing inherits nothing and is valued exactly as before.
++    [[nodiscard]] std::uint32_t rolling_inherited_demand(LaneId lane) const noexcept {
++        if (!rolling_retention_ || lane.value >= lane_count_) { return 0; }
++        const ActiveEntry& active  = active_[lane.value];
++        const ReuseDomainId domain = reuse_domain(active.session, active.publication_order);
++        std::uint32_t mask         = 0;
++        for (const PrefixDemandRecord& demand : demand_window_) {
++            if (demand.domain != domain) { continue; }
++            for (const PrefixShortlistKey& key : demand.exact_resident_keys) {
++                mask |= committed_demand_mask_for(key);
++            }
++        }
++        return mask;
++    }
++
++
+     [[nodiscard]] CatalogState catalog_state(std::uint32_t slot) const noexcept {
+         return slot < catalog_count_ ? catalog_[slot].state : CatalogState::Vacant;
+     }
+@@ -1421,7 +1446,7 @@ private:
+         case RetentionClass::Disposable:
+             return 1;
+         case RetentionClass::RecentPrivate:
+-            return 4;
++            return 8;
+         case RetentionClass::LiveSession:
+             return 16;
+         case RetentionClass::SharedStable:
+@@ -3362,6 +3387,7 @@ private:
+     std::uint32_t catalog_count_        = 0;
+     std::uint32_t shared_catalog_count_ = 0;
+     bool cache_enabled_                 = true;
++    bool rolling_retention_             = false;
+     std::array<LogicalLaneState, kMaximumConcurrency> lanes_{};
+     std::vector<CatalogEntry> catalog_;
+     std::vector<SharedCatalogEntry> shared_catalog_;
+diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
+index 686992f1..935c5624 100644
+--- a/src/serve/generation_service.cpp
++++ b/src/serve/generation_service.cpp
+@@ -421,6 +421,15 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
+     outcome.thinking            = result.thinking;
+     outcome.finish_reason       = result.finish_reason;
+     outcome.matched_stop_string = std::move(result.matched_stop_string);
++    outcome.next_token_top_logprobs =
++        std::move(result.next_token_top_logprobs.value_or(std::vector<ninfer::TopLogprob>{}));
++    for (auto& entry : outcome.next_token_top_logprobs) {
++        try {
++            entry.token_text = engine_->decode_token(entry.token_id);
++        } catch (const std::exception&) {
++            entry.token_text.clear();
++        }
++    }
+ 
+     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+     outcome.metrics.ttft_seconds =
+diff --git a/src/serve/generation_service.h b/src/serve/generation_service.h
+index 8540d6dd..a5d76b39 100644
+--- a/src/serve/generation_service.h
++++ b/src/serve/generation_service.h
+@@ -55,6 +55,8 @@ struct GenerationOutcome {
+     ninfer::ThinkingBudgetStats thinking;
+     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
+     std::optional<std::string> matched_stop_string;
++    // Next-token top-K distribution of the first generated token (empty when not requested).
++    std::vector<ninfer::TopLogprob> next_token_top_logprobs;
+     GenerationMetrics metrics;
+ };
+ 
+diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
+index a961e781..67cac41b 100644
+--- a/src/serve/openai_chat_request.cpp
++++ b/src/serve/openai_chat_request.cpp
+@@ -117,17 +117,19 @@ void validate_standard_output_controls(const Json& body) {
+             bad_request("logprobs must be a boolean", "logprobs");
+         }
+         if (body.at("logprobs").get<bool>()) {
+-            bad_request("logprobs=true requires per-token log probabilities in the response, which "
+-                        "NInfer does not provide",
++            bad_request("logprobs=true requires per-token log probabilities for the whole "
++                        "completion, which NInfer does not provide; use top_logprobs to export "
++                        "the next-token distribution",
+                         "logprobs", "logprobs_not_supported");
+         }
+     }
+     if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
+-        if (*top_logprobs != 0) {
+-            bad_request(
+-                "nonzero top_logprobs requires alternative-token probabilities in the response, "
+-                "which NInfer does not provide",
+-                "top_logprobs", "logprobs_not_supported");
++        if (*top_logprobs < 1 || *top_logprobs > 100) {
++            bad_request("top_logprobs must be in [1,100]", "top_logprobs");
++        }
++        if (body.contains("logprobs") && !body.at("logprobs").is_null() &&
++            body.at("logprobs").get<bool>()) {
++            bad_request("logprobs=true is not supported alongside top_logprobs", "logprobs");
+         }
+     }
+ 
+@@ -794,6 +796,12 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
+     }
+ }
+ 
++void parse_top_logprobs(const Json& body, GenerationRequest& output) {
++    if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
++        output.top_logprobs = *top_logprobs;
++    }
++}
++
+ struct TemplateOptions {
+     std::optional<bool> enable_thinking;
+     std::optional<bool> preserve_thinking;
+@@ -905,6 +913,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
+     parse_messages(body, output.generation);
+     parse_stop(body, output.generation);
+     parse_sampling(body, output.generation);
++    parse_top_logprobs(body, output.generation);
+     parse_stream_options(body, output);
+     parse_response_observations(body, output);
+     parse_output_limit(body, limits, output);
+diff --git a/src/serve/request.h b/src/serve/request.h
+index cf87d362..b8f75779 100644
+--- a/src/serve/request.h
++++ b/src/serve/request.h
+@@ -186,6 +186,8 @@ struct GenerationRequest {
+     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+     bool allow_engine_automatic_shared_prefixes = true;
+     SamplingParams sampling;
++    // Top-K next-token probability export for the first generated token (0/absent = off).
++    std::optional<int> top_logprobs;
+ 
+     [[nodiscard]] bool uses_tools() const noexcept {
+         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
+diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
+index 6a2376ab..612eb0ff 100644
+--- a/src/serve/serve_options.cpp
++++ b/src/serve/serve_options.cpp
+@@ -76,6 +76,8 @@ std::string serve_usage_text(const char* argv0) {
+            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+            "[--max-private-continuations N] [--max-shared-prefixes N] "
+            "[--max-long-anchors-per-continuation N] "
++           "[--context-cache-policy default|rolling] "
++           "[--disk-kv-path DIR] [--disk-kv-gib N] [--disk-kv-restore] "
+            "[--request-log-jsonl FILE] "
+            "[--response-store-max-records N] [--response-store-max-mib N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N] "
+@@ -233,6 +235,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+                 static_cast<std::uint32_t>(parse_nonnegative_int(
+                     require_value("--max-shared-prefixes"), "max-shared-prefixes"));
+             context_capacity_explicit = true;
++        } else if (arg == "--context-cache-policy") {
++            const std::string policy = require_value("--context-cache-policy");
++            if (policy == "rolling") {
++                options.context_cache.rolling_retention = true;
++            } else if (policy == "default" || policy == "off") {
++                options.context_cache.rolling_retention = false;
++            } else {
++                throw std::invalid_argument(
++                    "--context-cache-policy must be 'default' or 'rolling'");
++            }
++        } else if (arg == "--disk-kv-path") {
++            const std::string path = require_value("--disk-kv-path");
++            if (path.empty()) {
++                throw std::invalid_argument("--disk-kv-path must not be empty");
++            }
++            options.context_cache.disk_kv_path = path;
++        } else if (arg == "--disk-kv-gib") {
++            const std::uint64_t gib = parse_u64(require_value("--disk-kv-gib"), "disk-kv-gib");
++            options.context_cache.disk_kv_gib = static_cast<std::uint32_t>(gib);
++        } else if (arg == "--disk-kv-restore") {
++            options.context_cache.disk_kv_restore = true;
+         } else if (arg == "--max-long-anchors-per-continuation") {
+             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
+                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
+diff --git a/src/serve/translate.cpp b/src/serve/translate.cpp
+index ec410e4c..06819d1d 100644
+--- a/src/serve/translate.cpp
++++ b/src/serve/translate.cpp
+@@ -307,6 +307,9 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+     }
+     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
++    if (request.top_logprobs) {
++        options.top_logprobs = static_cast<std::uint32_t>(*request.top_logprobs);
++    }
+     options.output.raw                     = false;
+     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
+diff --git a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h
+index eb829645..b537ce33 100644
+--- a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h
++++ b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h
+@@ -137,6 +137,9 @@ public:
+     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
+                                                 bool allow_prefix_identity = true) const;
+     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
++
++    // Decodes one token id to its UTF-8 surface text as rendered by the artifact tokenizer.
++    [[nodiscard]] std::string decode_token(std::uint32_t token_id) const;
+     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
+     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+     [[nodiscard]] OutputSession
+diff --git a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
+index 4f66bff9..31ddc173 100644
+--- a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
++++ b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
+@@ -689,6 +689,9 @@ struct PrefillProgress {
+     runtime::ExecutionTiming timing;
+     std::optional<PendingBatch<Variant>> pending;
+     std::optional<CaptureOffer<Variant>> capture;
++    // Exact top-K next-token distribution of the first generated token; present only on the
++    // completing step when the request enabled the export (never affects sampling).
++    std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
+ };
+ 
+ enum class CaptureStatePlacement : std::uint8_t {
+diff --git a/src/targets/qwen3_6/impl/frontend/frontend.cpp b/src/targets/qwen3_6/impl/frontend/frontend.cpp
+index 75c71383..29c8664d 100644
+--- a/src/targets/qwen3_6/impl/frontend/frontend.cpp
++++ b/src/targets/qwen3_6/impl/frontend/frontend.cpp
+@@ -1577,6 +1577,11 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
+     return impl_->tokenizer->encode(text);
+ }
+ 
++std::string Frontend::decode_token(std::uint32_t token_id) const {
++    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
++    return std::string(impl_->tokenizer->decode_token_bytes(static_cast<int>(token_id), false));
++}
++
+ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
+                                             const StopPolicy& caller_stop,
+                                             const OutputOptions& output,
+diff --git a/src/targets/qwen3_6/impl/runtime/program.h b/src/targets/qwen3_6/impl/runtime/program.h
+index fcee5fc8..26864b34 100644
+--- a/src/targets/qwen3_6/impl/runtime/program.h
++++ b/src/targets/qwen3_6/impl/runtime/program.h
+@@ -5,6 +5,7 @@
+ #include "core/arena.h"
+ #include "core/gdn_replay_records.h"
+ #include "core/host_kv_arena.h"
++#include "core/disk_kv_bridge.h"
+ #include "ninfer/ops/gdn_replay.h"
+ #include "ninfer/ops/sampling.h"
+ #include "core/decode_graph.h"
+@@ -182,6 +183,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
+     std::uint32_t root_rebuild_tail_begin = 0;
+     qwen3_6::PreparedContextCache context_cache;
+     ops::SamplingConfig sampling;
++    std::optional<std::uint32_t> top_logprobs;
+     std::uint32_t text_kv_page_entitlement    = 0;
+     std::uint32_t backend_kv_page_entitlement = 0;
+     std::shared_ptr<const qwen3_6::VisionControlPlan> vision_control_plan;
+@@ -247,6 +249,7 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
+     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> capture_groups;
+     std::vector<NINFER_QWEN36_RUNTIME_NS::CaptureGroup> shared_candidates;
+     ops::SamplingConfig sampling;
++    std::optional<std::uint32_t> top_logprobs;
+     std::uint32_t text_kv_page_entitlement    = 0;
+     std::uint32_t backend_kv_page_entitlement = 0;
+     runtime::LaneId destination{};
+@@ -465,6 +468,8 @@ struct RequestControl {
+     detail::PhysicalResources active_resources;
+     detail::PhysicalResources optional_resources;
+     bool publish_continuation = true;
++    // Top-K next-token export requested by this request (0/absent = no export).
++    std::optional<std::uint32_t> top_logprobs;
+ 
+     struct Prefill {
+         PreparedPromptData prompt;
+@@ -475,6 +480,12 @@ struct RequestControl {
+         std::uint64_t pending_capture_offer = 0;
+         std::uint32_t base                  = 0;
+         std::uint32_t cursor                = 0;
++        // L3 (disk) restore: the reuse frontier the engine admission contract was
++        // built on (reusable_prompt_tokens at admission). Normally equal to base;
++        // a failed disk seed keeps the advertised value while prefill replays
++        // [advertised_base, cursor) unreported, so the engine-visible contract
++        // (suffix tokens = prompt_tokens - advertised_base) stays exact.
++        std::uint32_t advertised_base       = 0;
+         std::uint32_t prompt_tokens         = 0;
+         std::uint32_t initial_mtp_extent    = 0;
+         double elapsed_seconds              = 0.0;
+@@ -647,6 +658,13 @@ public:
+     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
+     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
+     std::unique_ptr<HostKVExtentStore> host_kv_extents;
++    // L3 (disk) cold tier. Null unless --disk-kv-path is set. Content-keyed spill
++    // of host KV pages that are losing their last host replica under pressure;
++    // a later re-admission restores them from disk instead of re-prefilling.
++    std::unique_ptr<DiskKVBridge> disk_kv;
++    // Read side (--disk-kv-restore): seed a Root sequence's prefix [0,F) from
++    // disk. Default false => write-only tier (byte-identical two-tier behavior).
++    bool disk_kv_restore = false;
+     std::size_t text_host_kv_page_stride    = 0;
+     std::size_t backend_host_kv_page_stride = 0;
+     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
+@@ -675,6 +693,7 @@ public:
+ 
+     PinnedHostBuffer round_host;
+     std::optional<PinnedHostBuffer> score_logprobs_host;
++    std::optional<PinnedHostBuffer> top_logprobs_host;
+     TokenId* host_tokens = nullptr;
+     std::optional<PinnedHostBuffer> ordinary_host;
+     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
+@@ -872,6 +891,11 @@ private:
+         std::vector<DeviceKVPageHandle> backend_restore_destinations;
+         std::vector<runtime::ContextTransferObservation> transfer_observations;
+         runtime::ContextOperationCounts operations;
++        // L3 (disk) tier restore: if a Root-path request's longest on-disk
++        // restorable prefix (computed at admission) is non-zero, materialize
++        // that prefix back onto the device (KV pages H2D + the recurrent state
++        // image) and advance the prefill past it. F is in tokens.
++        std::optional<std::uint32_t> l3_restore_frontier;
+         bool state_restored                 = false;
+         bool transfer_submitted             = false;
+         std::uint8_t transfer_timer_mask    = 0;
+@@ -1125,6 +1149,27 @@ private:
+         std::vector<runtime::CheckpointRecoveryAlternativeWork>& alternatives,
+         PressureRecoveryScratch& scratch, std::uint64_t& projection_work) const;
+     void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
++    // L3 (disk) tier: best-effort spill of the host KV run that is about to lose
++    // its last host replica when `checkpoint` is dropped. No-op (and zero cost
++    // path-wise) unless --disk-kv-path is set. A miss on later restore falls
++    // back to exactly today's recompute, so this can never make a result wrong.
++    void spill_dying_checkpoint_pages(SequenceState& sequence, runtime::CheckpointRef checkpoint,
++                                      std::uint32_t retained_main_frontier,
++                                      std::uint32_t retained_backend_frontier);
++    // Owner-wide spill (the dominant recompute source): called from the
++    // release_sequence_kv* paths before the host pages are released. No-op
++    // unless --disk-kv-path is set.
++    void spill_dying_owner_pages(SequenceState& sequence);
++    // L3 (disk) tier — read side: seed this Root request's device KV [0,E)
++    // and the GDN state image at E from the disk tier when the admission
++    // probe marked a restorable boundary. After a true return, prefill
++    // recomputes only [E, prompt_tokens). Hard fallback: any miss/failure
++    // returns false and the sequence stays in the clean full-recompute
++    // state (staged base/cursor untouched; ordinary prefill overwrites every
++    // page). A restored byte is byte-identical to what the engine wrote
++    // (content-addressed by the digest chain), so success is bit-exact.
++    bool restore_root_from_disk(SequenceState& sequence, MaterializationTransaction& transaction,
++                                RequestControl::Prefill& staged, std::uint32_t prompt_tokens);
+     [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
+     [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
+                                             const runtime::BatchedGeneratedRound& round);
+diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
+index e2a84d3d..9af26ec2 100644
+--- a/src/targets/qwen3_6/impl/runtime/program_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
+@@ -17,13 +17,17 @@
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
++#include <cmath>
++#include <cstring>
+ #include <exception>
+ #include <iterator>
+ #include <limits>
++#include <numeric>
+ #include <stdexcept>
+ #include <string>
+ #include <type_traits>
+ #include <utility>
++#include <vector>
+ 
+ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+ namespace {
+@@ -916,6 +920,41 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+         }
+     }
+ 
++    // L3 (disk) cold tier: opt-in, default off (empty path). Files are laid out
++    // per KV-layout fingerprint so a different model/dtype/spec-backend never
++    // collides with another engine's spill content.
++    if (!plan.context_cache.disk_kv_path.empty()) {
++        const std::size_t disk_capacity =
++            plan.context_cache.disk_kv_gib != 0
++                ? static_cast<std::size_t>(plan.context_cache.disk_kv_gib) << 30
++                : 64ULL << 30;
++        const std::string model_dir =
++            "kv_" + std::to_string(static_cast<int>(plan.kv_storage)) + "_m" +
++            std::to_string(text_host_kv_page_stride) + "_b" +
++            std::to_string(backend_host_kv_page_stride);
++        DiskKVBridge::Options dko;
++        dko.base_path           = plan.context_cache.disk_kv_path + "/" + model_dir;
++        dko.main_page_stride    = text_host_kv_page_stride;
++        dko.backend_page_stride = backend_host_kv_page_stride;
++        dko.state_page_stride   = state_images ? state_images->host_layout().image_bytes : 0;
++        dko.capacity_bytes      = disk_capacity;
++        dko.verify_crc          = true;
++        try {
++            disk_kv = std::make_unique<DiskKVBridge>(std::move(dko));
++            // Read side only when a state family exists (the GDN/linear state is
++            // not derivable from KV, so a KV-only restore is useless) and the
++            // operator opted in. MTP restores the draft (backend) KV family too;
++            // DFlash stays gated out (its draft state semantics are untested on
++            // the restore path).
++            disk_kv_restore =
++                plan.context_cache.disk_kv_restore && dko.state_page_stride != 0 &&
++                (plan.speculative_backend == SpeculativeBackend::None ||
++                 plan.speculative_backend == SpeculativeBackend::Mtp);
++        } catch (const std::exception& e) {
++            throw std::runtime_error("disk KV tier failed to open: " + std::string(e.what()));
++        }
++    }
++
+     io = qwen3_6::RoundState(backing, plan.persistent.round);
+     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
+         throw std::logic_error("round-state MTP extension does not match the sequence plan");
+@@ -2846,10 +2885,623 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
+     } else if (speculative_backend == SpeculativeBackend::DFlash) {
+         sequence.dflash_context_frontier = retained->backend_frontier;
+     }
++    if (disk_kv) {
++        spill_dying_checkpoint_pages(sequence, checkpoint, retained->main_frontier,
++                                     retained->backend_frontier);
++    }
+     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+     refresh_state_views(sequence);
+ }
+ 
++void ProgramImplCore::spill_dying_checkpoint_pages(SequenceState& sequence,
++                                                   runtime::CheckpointRef checkpoint,
++                                                   std::uint32_t retained_main_frontier,
++                                                   std::uint32_t retained_backend_frontier) {
++    if (disk_kv == nullptr || !sequence.kv || !host_kv_extents) { return; }
++    const std::uint32_t dropped_main_pages = kv_pages_for_frontier(checkpoint.frontier);
++    const std::uint32_t retained_main_pages = kv_pages_for_frontier(retained_main_frontier);
++    // Bounded work: a single drop may cover a whole large checkpoint; spilling
++    // more than this would stall the pressure path for seconds. Runs larger
++    // than the cap are skipped (fallback = recompute, exactly today's behavior).
++    constexpr std::uint32_t kSpillPageCap = 512;
++    const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
++                              (static_cast<std::uint32_t>(proposal_head) << 8U) |
++                              (static_cast<std::uint32_t>(kv_storage) << 16U);
++    auto spill_family = [&](bool is_main, KVAddressSpaceStore& addresses,
++                            LogicalKVPageStore& pages, KVAddressSpaceHandle address,
++                            std::uint32_t retained_pages, std::uint32_t dropped_pages,
++                            std::size_t stride, DiskKVKind kind) {
++        if (stride == 0 || dropped_pages <= retained_pages) { return; }
++        // A restore walks pages from frontier 0 and stops at the FIRST miss, so
++        // only a contiguous prefix from the low end actually saves recompute.
++        // Spill the oldest (lowest-frontier) pages; if the run exceeds the cap,
++        // spill the first kSpillPageCap (best partial prefix) rather than skip
++        // the whole drop — a partial prefix still beats a full recompute.
++        const std::uint32_t spill_end =
++            std::min(dropped_pages, retained_pages + kSpillPageCap);
++        std::vector<std::byte> scratch(stride);
++        for (std::uint32_t p = retained_pages; p < spill_end; ++p) {
++            const LogicalKVPageHandle logical = addresses.logical_page(address, p);
++            if (!pages.host_resident(logical)) { continue; }
++            const std::uint32_t page_frontier =
++                p * static_cast<std::uint32_t>(kPagedKVPageSize) + pages.committed_columns(logical);
++            if (page_frontier >= sequence.prefix_digests.size()) { continue; }
++            const auto digest = sequence.prefix_digests.at(page_frontier);
++            const DiskKVIdentity id{.lo     = digest[0],
++                                    .hi     = digest[1],
++                                    .tag    = tag,
++                                    .frontier = page_frontier};
++            const HostKVPageReplica replica  = pages.host_replica(logical);
++            const auto page_view = host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
++            std::memcpy(scratch.data(), page_view.data(), stride);
++            if (!disk_kv->spill_page_wait(
++                    id, kind, std::span<const std::byte>(scratch.data(), stride),
++                    std::chrono::milliseconds(5000))) {
++                break;  // queue stalled: keep the spilt prefix contiguous
++            }
++        }
++        (void)is_main;
++    };
++    spill_family(true, *text_kv_addresses, *text_kv_pages, sequence.kv->text, retained_main_pages,
++                 dropped_main_pages, text_host_kv_page_stride, DiskKVKind::MainKV);
++    if (sequence.kv->backend) {
++        const std::uint32_t dropped_backend_pages =
++            kv_pages_for_frontier(backend_frontier_at(speculative_backend, checkpoint.frontier));
++        const std::uint32_t retained_backend_pages =
++            kv_pages_for_frontier(retained_backend_frontier);
++        spill_family(false, *backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
++                     retained_backend_pages, dropped_backend_pages, backend_host_kv_page_stride,
++                     DiskKVKind::BackendKV);
++    }
++}
++
++// L3 (disk) tier write point 2 — the DOMINANT one. The whole owner (an entire
++// session) is about to lose all of its KV: this is where production
++// recompute comes from (37h of request logs: root-path requests = 53.2% of
++// recomputed tokens, all with 0 prefix hits — evicted sessions returning as
++// fresh prompts). A restore walks pages from frontier 0 and stops at the
++// FIRST miss, so only a contiguous prefix from 0 pays: walk from page 0,
++// stop at the first page that is not host-resident. The bridge is async
++// (bounded queue + writer thread): the caller pays only memcpys.
++void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
++    if (disk_kv == nullptr || !sequence.kv || !host_kv_extents || !text_kv_addresses ||
++        !text_kv_pages) {
++        return;
++    }
++    try {
++        const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
++                                  (static_cast<std::uint32_t>(proposal_head) << 8U) |
++                                  (static_cast<std::uint32_t>(kv_storage) << 16U);
++        // Caller-side copy budget per session death (~6 GiB at 1.5 MiB/page):
++        // covers a full 200K-token session. Spill is prefix-contiguous by
++        // construction; restore needs nothing beyond the first unreadable page.
++        constexpr std::uint32_t kOwnerSpillCap = 4096;
++        auto spill_prefix = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
++                                KVAddressSpaceHandle address, std::uint32_t total_pages,
++                                std::size_t stride, DiskKVKind kind) {
++            if (stride == 0) { return; }
++            const std::uint32_t page_cap = std::min(total_pages, kOwnerSpillCap);
++            std::vector<std::byte> scratch(stride);
++            std::uint32_t spilled = 0;
++            for (std::uint32_t p = 0; p < page_cap; ++p) {
++                const LogicalKVPageHandle logical = addresses.logical_page(address, p);
++                const std::uint32_t page_frontier =
++                    p * static_cast<std::uint32_t>(kPagedKVPageSize) + pages.committed_columns(logical);
++                if (page_frontier >= sequence.prefix_digests.size()) { break; }
++                // Every live replica is either host- or device-resident: the
++                // pressure pipeline demotes device->host and never drops a sole
++                // replica. Host pages read directly; device-only pages get a
++                // one-shot D2H via a temporary extent.
++                bool ok = false;
++                if (pages.host_resident(logical)) {
++                    const HostKVPageReplica replica = pages.host_replica(logical);
++                    const auto page_view =
++                        host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
++                    std::memcpy(scratch.data(), page_view.data(), stride);
++                    ok = true;
++                } else if (pages.device_resident(logical) && pages.can_pin_source(logical)) {
++                    const LogicalKVPageHandle single = logical;
++                    if (auto reservation =
++                            host_kv_extents->prepare(pages,
++                                                     std::span<const LogicalKVPageHandle>(&single, 1))) {
++                        try {
++                            const DeviceKVPageHandle dhandle = pages.physical(logical);
++                            pages.physical_pool().copy_to_host(
++                                {&dhandle, 1}, host_kv_extents->writable_view(*reservation),
++                                device.transfer_stream);
++                            if (device.transfer_stream != nullptr) {
++                                (void)cudaStreamSynchronize(device.transfer_stream);
++                            }
++                            std::memcpy(scratch.data(),
++                                        host_kv_extents->writable_view(*reservation).data(), stride);
++                            ok = true;
++                        } catch (...) {
++                            ok = false;
++                        }
++                        host_kv_extents->abort(*reservation);
++                    }
++                }
++                if (!ok) {
++                    // DIAG: why the prefix ended here (data-loss triage).
++                    fprintf(stderr,
++                            "[l3-spill] kind=%d break p=%u fr=%u comm=%u host=%d dev=%d pin=%d "
++                            "ext=%u/%u spilled=%u\n",
++                            static_cast<int>(kind), p, page_frontier,
++                            pages.committed_columns(logical),
++                            static_cast<int>(pages.host_resident(logical)),
++                            static_cast<int>(pages.device_resident(logical)),
++                            static_cast<int>(pages.device_resident(logical) &&
++                                             pages.can_pin_source(logical)),
++                            host_kv_extents->occupied(), host_kv_extents->capacity(), spilled);
++                    break;  // page unreadable: prefix ends here
++                }
++                const auto digest = sequence.prefix_digests.at(page_frontier);
++                const DiskKVIdentity id{.lo     = digest[0],
++                                        .hi     = digest[1],
++                                        .tag    = tag,
++                                        .frontier = page_frontier};
++                if (!disk_kv->spill_page_wait(
++                        id, kind, std::span<const std::byte>(scratch.data(), stride),
++                        std::chrono::milliseconds(5000))) {
++                    // Queue stalled past the deadline: stop at the prefix end
++                    // (a hole would break the restore walk anyway).
++                    fprintf(stderr,
++                            "[l3-spill] kind=%d queue timeout p=%u fr=%u spilled=%u — "
++                            "prefix ends\n",
++                            static_cast<int>(kind), p, page_frontier, spilled);
++                    break;
++                }
++                ++spilled;
++            }
++            fprintf(stderr, "[l3-spill] kind=%d done total=%u spilled=%u\n",
++                    static_cast<int>(kind), page_cap, spilled);
++        };
++        const std::uint32_t main_pages = kv_pages_for_frontier(sequence.execution_frontier);
++        spill_prefix(*text_kv_addresses, *text_kv_pages, sequence.kv->text, main_pages,
++                     text_host_kv_page_stride, DiskKVKind::MainKV);
++        if (sequence.kv->backend && backend_kv_addresses && backend_kv_pages) {
++            const std::uint32_t backend_pages =
++                kv_pages_for_frontier(backend_frontier_at(speculative_backend, sequence.execution_frontier));
++            spill_prefix(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
++                         backend_pages, backend_host_kv_page_stride, DiskKVKind::BackendKV);
++        }
++        // State image (L3): the 48-layer GDN/hidden recurrent state at the endpoint
++        // frontier. Not derivable from KV, so it must spill (and later restore)
++        // as a pair with the KV pages, or a KV-only restore still forces full
++        // prefill of the linear layers. Synchronous spill (146 MiB) — a single
++        // blob, never goes through the bounded page queue.
++        if (sequence.endpoint_valid && sequence.execution_frontier != 0 &&
++            sequence.execution_frontier < sequence.prefix_digests.size() &&
++            disk_kv->slot_count(DiskKVKind::StateImage) != 0) {
++            const StateImageHandle state = sequence.state.read;
++            if (state_store->valid(state)) {
++                const std::size_t stride =
++                    static_cast<std::size_t>(state_images->host_layout().image_bytes);
++                // Demote to host if needed so the bytes are readable; leave the
++                // replica in place (it is freed with the sequence shortly).
++                if (state_store->residency(state) == StateReplicaResidency::DeviceOnly) {
++                    if (auto t = state_store->begin_device_to_host(state, device.transfer_stream)) {
++                        if (device.transfer_stream != nullptr) {
++                            (void)cudaStreamSynchronize(device.transfer_stream);
++                        }
++                        state_store->publish_transfer(std::move(*t), true);
++                    }
++                }
++                const auto view = state_store->host_view(state);
++                if (view) {
++                    const std::uint32_t sf = sequence.execution_frontier;
++                    const auto sdigest = sequence.prefix_digests.at(sf);
++                    const DiskKVIdentity sid{.lo       = sdigest[0],
++                                              .hi       = sdigest[1],
++                                              .tag      = tag,
++                                              .frontier = sf};
++                    disk_kv->spill_page_sync(sid, DiskKVKind::StateImage,
++                                             std::span<const std::byte>(view->data, stride));
++                }
++            }
++        }
++        // Restore seam (L3 read side complement): the multi-turn seam BEFORE the
++        // generated response is the deepest boundary a client-authored follow-up
++        // turn provably shares with this sequence (tokenizer round-trip drift makes
++        // boundaries INSIDE the generated text unmatchable — measured: chain breaks
++        // right after the assistant opener). The rewrite checkpoint holds the GDN
++        // state at exactly that seam and its frontier F < endpoint frontier. Spill
++        // its state keyed digest(F) plus the seam-tail KV page so probe/seed can
++        // restore at F for any client follow-up (SGLang HiCache semantics).
++        if (sequence.rewrite_checkpoint.valid && sequence.rewrite_state &&
++            sequence.rewrite_checkpoint.frontier != 0 &&
++            sequence.rewrite_checkpoint.frontier < sequence.execution_frontier &&
++            sequence.rewrite_checkpoint.frontier < sequence.prefix_digests.size() &&
++            disk_kv->slot_count(DiskKVKind::StateImage) != 0) {
++            const std::uint32_t F = sequence.rewrite_checkpoint.frontier;
++            const StateImageHandle seam_state = *sequence.rewrite_state;
++            if (state_store->valid(seam_state)) {
++                const std::size_t stride =
++                    static_cast<std::size_t>(state_images->host_layout().image_bytes);
++                if (state_store->residency(seam_state) == StateReplicaResidency::DeviceOnly) {
++                    if (auto t = state_store->begin_device_to_host(seam_state,
++                                                                   device.transfer_stream)) {
++                        if (device.transfer_stream != nullptr) {
++                            (void)cudaStreamSynchronize(device.transfer_stream);
++                        }
++                        state_store->publish_transfer(std::move(*t), true);
++                    }
++                }
++                const auto view = state_store->host_view(seam_state);
++                if (view) {
++                    const auto fdigest = sequence.prefix_digests.at(F);
++                    const DiskKVIdentity fid{.lo       = fdigest[0],
++                                              .hi       = fdigest[1],
++                                              .tag      = tag,
++                                              .frontier = F};
++                    disk_kv->spill_page_sync(fid, DiskKVKind::StateImage,
++                                             std::span<const std::byte>(view->data, stride));
++                    // Seam-tail KV page keyed at digest(F) (F is rarely page-aligned;
++                    // the seed reads pages [0, F/64) as full pages plus this partial).
++                    const std::uint32_t seam_page  = F / static_cast<std::uint32_t>(kPagedKVPageSize);
++                    const LogicalKVPageHandle logical =
++                        text_kv_addresses->logical_page(sequence.kv->text, seam_page);
++                    bool seam_tail_spilled = false;
++                    if (text_kv_pages->host_resident(logical)) {
++                        const HostKVPageReplica replica = text_kv_pages->host_replica(logical);
++                        const auto page_view = host_kv_extents->view(replica.extent)
++                                                   .subview(replica.page_offset, 1);
++                        std::vector<std::byte> scratch(text_host_kv_page_stride);
++                        std::memcpy(scratch.data(), page_view.data(), text_host_kv_page_stride);
++                        (void)disk_kv->spill_page_wait(
++                            fid, DiskKVKind::MainKV, std::span<const std::byte>(scratch),
++                            std::chrono::milliseconds(5000));
++                        seam_tail_spilled = true;
++                    } else if (text_kv_pages->device_resident(logical) &&
++                               text_kv_pages->can_pin_source(logical)) {
++                        // Owner death may find the seam page still device-only
++                        // (never demoted). One-shot D2H, same as spill_prefix.
++                        const LogicalKVPageHandle single = logical;
++                        if (auto reservation = host_kv_extents->prepare(
++                                *text_kv_pages, std::span<const LogicalKVPageHandle>(&single, 1))) {
++                            try {
++                                const DeviceKVPageHandle dhandle = text_kv_pages->physical(logical);
++                                text_kv_pages->physical_pool().copy_to_host(
++                                    {&dhandle, 1}, host_kv_extents->writable_view(*reservation),
++                                    device.transfer_stream);
++                                if (device.transfer_stream != nullptr) {
++                                    (void)cudaStreamSynchronize(device.transfer_stream);
++                                }
++                                std::vector<std::byte> scratch(text_host_kv_page_stride);
++                                std::memcpy(scratch.data(),
++                                            host_kv_extents->writable_view(*reservation).data(),
++                                            text_host_kv_page_stride);
++                                (void)disk_kv->spill_page_wait(
++                                    fid, DiskKVKind::MainKV, std::span<const std::byte>(scratch),
++                                    std::chrono::milliseconds(5000));
++                                seam_tail_spilled = true;
++                            } catch (...) {
++                                host_kv_extents->abort(*reservation);
++                            }
++                            host_kv_extents->abort(*reservation);
++                        }
++                    }
++                    (void)seam_tail_spilled;
++                    // MTP draft seam-tail page: the backend-family mirror of the
++                    // main tail page above, keyed at the backend frontier bF = F-1
++                    // (the draft lags the target by one token). Without it the MTP
++                    // probe's backend coverage check at the seam fails and MTP
++                    // sessions can never restore from disk.
++                    if (speculative_backend == SpeculativeBackend::Mtp &&
++                        sequence.kv->backend && backend_kv_pages && backend_kv_addresses) {
++                        const std::uint32_t bF = backend_frontier_at(speculative_backend, F);
++                        if (bF > 0 && bF % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
++                            const std::uint32_t bseam_page =
++                                bF / static_cast<std::uint32_t>(kPagedKVPageSize);
++                            const LogicalKVPageHandle blogical =
++                                backend_kv_addresses->logical_page(*sequence.kv->backend, bseam_page);
++                            const auto bdigest = sequence.prefix_digests.at(bF);
++                            const DiskKVIdentity bid{.lo       = bdigest[0],
++                                                     .hi       = bdigest[1],
++                                                     .tag      = tag,
++                                                     .frontier = bF};
++                            bool backend_tail_spilled = false;
++                            if (backend_kv_pages->host_resident(blogical)) {
++                                const HostKVPageReplica replica =
++                                    backend_kv_pages->host_replica(blogical);
++                                const auto page_view = host_kv_extents->view(replica.extent)
++                                                           .subview(replica.page_offset, 1);
++                                std::vector<std::byte> scratch(backend_host_kv_page_stride);
++                                std::memcpy(scratch.data(), page_view.data(),
++                                            backend_host_kv_page_stride);
++                                (void)disk_kv->spill_page_wait(
++                                    bid, DiskKVKind::BackendKV, std::span<const std::byte>(scratch),
++                                    std::chrono::milliseconds(5000));
++                                backend_tail_spilled = true;
++                            } else if (backend_kv_pages->device_resident(blogical) &&
++                                       backend_kv_pages->can_pin_source(blogical)) {
++                                const LogicalKVPageHandle single = blogical;
++                                if (auto reservation = host_kv_extents->prepare(
++                                        *backend_kv_pages,
++                                        std::span<const LogicalKVPageHandle>(&single, 1))) {
++                                    try {
++                                        const DeviceKVPageHandle dhandle =
++                                            backend_kv_pages->physical(blogical);
++                                        backend_kv_pages->physical_pool().copy_to_host(
++                                            {&dhandle, 1},
++                                            host_kv_extents->writable_view(*reservation),
++                                            device.transfer_stream);
++                                        if (device.transfer_stream != nullptr) {
++                                            (void)cudaStreamSynchronize(device.transfer_stream);
++                                        }
++                                        std::vector<std::byte> scratch(backend_host_kv_page_stride);
++                                        std::memcpy(scratch.data(),
++                                                    host_kv_extents->writable_view(*reservation)
++                                                        .data(),
++                                                    backend_host_kv_page_stride);
++                                        (void)disk_kv->spill_page_wait(
++                                            bid, DiskKVKind::BackendKV,
++                                            std::span<const std::byte>(scratch),
++                                            std::chrono::milliseconds(5000));
++                                        backend_tail_spilled = true;
++                                    } catch (...) {
++                                        host_kv_extents->abort(*reservation);
++                                    }
++                                    host_kv_extents->abort(*reservation);
++                                }
++                            }
++                            (void)backend_tail_spilled;
++                        }
++                    }
++                }
++            }
++        }
++    } catch (...) {
++        // noexcept release paths: a spill failure must never kill the engine.
++    }
++    }
++
++    bool ProgramImplCore::restore_root_from_disk(SequenceState& sequence,
++                                                 MaterializationTransaction& transaction,
++                                                 RequestControl::Prefill& staged,
++                                                 std::uint32_t prompt_tokens) {
++        if (!disk_kv || !disk_kv_restore || !transaction.l3_restore_frontier || !sequence.kv ||
++            !text_kv_addresses || !text_kv_pages || !host_kv_arena || !state_images ||
++            staged.reuse != ReusePath::Root) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: prereq missing (restore=%d frontier=%u reuse=%d)\n",
++                    static_cast<unsigned>(sequence.lane), disk_kv_restore,
++                    transaction.l3_restore_frontier.value_or(0), static_cast<int>(staged.reuse));
++            return false;
++        }
++        const std::uint32_t E = *transaction.l3_restore_frontier;
++        if (E == 0 || E >= prompt_tokens) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: frontier E out of range\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++        // v1/v2 read side: None and MTP. For MTP the draft (backend) KV family is
++        // restored too — a draft token is always verified by the target model, so
++        // worst case of a botched backend restore is "no MTP speedup", never a
++        // wrong output. DFlash stays gated out (its draft state semantics are
++        // untested on the restore path).
++        if (speculative_backend != SpeculativeBackend::None &&
++            speculative_backend != SpeculativeBackend::Mtp) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: backend not None/MTP\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++        const auto restore_started = Clock::now();
++        // Vision tokens and capture boundaries below E cannot be replayed from the
++        // tail: restore only for plain-text prompts without sub-E capture groups.
++        if (staged.vision || staged.prompt.has_media()) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: vision/media prompt\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++        for (const CaptureGroup& group : staged.capture_groups) {
++            if (group.frontier <= E) {
++fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: capture group at or below E\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++            }
++        }
++        const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
++                                  (static_cast<std::uint32_t>(proposal_head) << 8U) |
++                                  (static_cast<std::uint32_t>(kv_storage) << 16U);
++        const auto& digests = materialization_prefix_digests_;
++        if (E >= digests.size()) {
++fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: digests shorter than E\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++
++        // 1) Disk -> pinned host scratch -> device, chunked (256 pages ~ 384 MiB
++        //    per scratch so the host arena is never held hostage by one restore).
++        //    Every disk page is read and verified (CRC) before ANY device write;
++        //    the first miss aborts with the sequence untouched.
++        const std::uint32_t page_count = kv_pages_for_frontier(E);
++        const HostKVPageLayout* layout_ptr =
++            host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
++        if (layout_ptr == nullptr) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: host layout unavailable\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++        const HostKVPageLayout& layout = *layout_ptr;
++        const std::size_t stride = layout.page_stride;
++        std::vector<DeviceKVPageHandle> destinations(page_count);
++        for (std::uint32_t p = 0; p < page_count; ++p) {
++            destinations[p] = text_kv_pages->physical(
++                text_kv_addresses->logical_page(sequence.kv->text, p));
++        }
++        constexpr std::uint32_t kRestoreChunk = 256;
++        for (std::uint32_t begin = 0; begin < page_count; begin += kRestoreChunk) {
++            const std::uint32_t count = std::min(kRestoreChunk, page_count - begin);
++            std::optional<HostKVAllocation> scratch = host_kv_arena->allocate(layout, count);
++            if (!scratch) {
++                fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: host scratch allocation\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++            }
++            const HostKVAllocationView host = host_kv_arena->writable_view(*scratch);
++            for (std::uint32_t i = 0; i < count; ++i) {
++                // Same page key as the write side: a full page keys at (p+1)*64,
++                // the partial tail page at E.
++                const std::uint32_t p       = begin + i;
++                const std::uint32_t frontier = std::min((p + 1U) * std::uint32_t(kPagedKVPageSize), E);
++                const auto digest          = digests.at(frontier);
++                const DiskKVIdentity id{.lo       = digest[0],
++                                        .hi       = digest[1],
++                                        .tag      = tag,
++                                        .frontier = frontier};
++                if (!disk_kv->restore_page(id, DiskKVKind::MainKV,
++                                           std::span<std::byte>(host.data() + std::size_t(i) * stride,
++                                                               stride))) {
++                    fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: page p=%u frontier=%u\n",
++                            static_cast<unsigned>(sequence.lane), p, frontier);
++                    return false;  // page lost on disk: full recompute, never partial
++                }
++            }
++            text_kv_pages->physical_pool().copy_from_host(
++                host_kv_arena->view(*scratch),
++                std::span<const DeviceKVPageHandle>(destinations.data() + begin, count),
++                device.transfer_stream);
++            if (device.transfer_stream != nullptr) {
++                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
++            }
++        }
++
++        // 1b) MTP draft (backend) KV [0, E-1) — restore into the freshly
++        //     materialized backend pages. Keyed identically to the write side
++        //     (same tag, page digest at min((p+1)*64, E-1)); a missing page
++        //     aborts with a clean full-recompute fallback (backend is never
++        //     committed until the very end). A draft token is always verified by
++        //     the target model, so a partial/missing backend restore degrades to
++        //     "no MTP speedup", never a wrong output.
++        if (speculative_backend == SpeculativeBackend::Mtp &&
++            backend_kv_pages && backend_kv_addresses && sequence.kv->backend) {
++            const std::uint32_t bfrontier = backend_frontier_at(speculative_backend, E);
++            if (bfrontier > 0) {
++                const std::uint32_t bpage_count = kv_pages_for_frontier(bfrontier);
++                const HostKVPageLayout* blayout_ptr =
++                    host_kv_arena->layout_for(backend_kv_pages->physical_pool().geometry());
++                if (blayout_ptr == nullptr) {
++                    fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: backend host layout\n",
++                            static_cast<unsigned>(sequence.lane));
++                    return false;
++                }
++                const std::size_t bstride = blayout_ptr->page_stride;
++                std::vector<DeviceKVPageHandle> bdestinations(bpage_count);
++                for (std::uint32_t p = 0; p < bpage_count; ++p) {
++                    bdestinations[p] = backend_kv_pages->physical(
++                        backend_kv_addresses->logical_page(*sequence.kv->backend, p));
++                }
++                for (std::uint32_t begin = 0; begin < bpage_count; begin += kRestoreChunk) {
++                    const std::uint32_t count = std::min(kRestoreChunk, bpage_count - begin);
++                    std::optional<HostKVAllocation> bscratch =
++                        host_kv_arena->allocate(*blayout_ptr, count);
++                    if (!bscratch) {
++                        fprintf(stderr,
++                                "[l3-restore] seq lane=%u seed FAILED: backend host scratch\n",
++                                static_cast<unsigned>(sequence.lane));
++                        return false;
++                    }
++                    const HostKVAllocationView bhost = host_kv_arena->writable_view(*bscratch);
++                    for (std::uint32_t i = 0; i < count; ++i) {
++                        const std::uint32_t p       = begin + i;
++                        const std::uint32_t frontier = std::min((p + 1U) *
++                                                                    std::uint32_t(kPagedKVPageSize),
++                                                                bfrontier);
++                        const auto digest = digests.at(frontier);
++                        const DiskKVIdentity id{.lo       = digest[0],
++                                                .hi       = digest[1],
++                                                .tag      = tag,
++                                                .frontier = frontier};
++                        if (!disk_kv->restore_page(id, DiskKVKind::BackendKV,
++                                                   std::span<std::byte>(
++                                                       bhost.data() + std::size_t(i) * bstride,
++                                                       bstride))) {
++                            fprintf(stderr,
++                                    "[l3-restore] seq lane=%u seed FAILED: backend page p=%u frontier=%u\n",
++                                    static_cast<unsigned>(sequence.lane), p, frontier);
++                            return false;
++                        }
++                    }
++                    backend_kv_pages->physical_pool().copy_from_host(
++                        host_kv_arena->view(*bscratch),
++                        std::span<const DeviceKVPageHandle>(bdestinations.data() + begin, count),
++                        device.transfer_stream);
++                    if (device.transfer_stream != nullptr) {
++                        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
++                    }
++                }
++            }
++        }
++
++        // 2) The GDN/hidden state image at the exact frontier E. Not derivable
++        //    from KV: without it the linear layers would recompute from zero.
++        //    Borrow a slot from the existing pinned HostStatePool (no fresh pinned
++        //    allocation — the WSL2 cudaMallocHost budget is already consumed by the
++        //    6 GiB host KV arena).
++        if (!host_state_images) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: no host state pool\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++        auto host_slot = host_state_images->allocate();
++        if (!host_slot) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: host state slot\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }        const std::size_t state_bytes = state_images->host_layout().image_bytes;
++        const auto sdigest            = digests.at(E);
++        const DiskKVIdentity sid{.lo   = sdigest[0],
++                                 .hi   = sdigest[1],
++                                 .tag  = tag,
++                                 .frontier = E};
++        bool state_loaded = false;
++        try {
++            state_loaded = disk_kv->restore_page(
++                sid, DiskKVKind::StateImage,
++                std::span<std::byte>(host_state_images->writable_view(*host_slot).data, state_bytes));
++            if (state_loaded) {
++                const StateImageSelectors selectors = state_selectors(sequence);
++                state_images->copy_from_host(host_state_images->view(*host_slot),
++                                             selectors.destination, device.transfer_stream);
++                if (device.transfer_stream != nullptr) {
++                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
++                }
++            }
++        } catch (...) {
++            state_loaded = false;
++        }
++        host_state_images->release(*host_slot);
++        if (!state_loaded) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: state image load\n",
++                    static_cast<unsigned>(sequence.lane));
++            return false;
++        }
++        // 3) Commit: device KV and the recurrent state are valid through E, so
++        //    prefill continues from E and recomputes only [E, prompt_tokens).
++        //    (The sequence's ledger/digests already cover the whole prompt, which
++        //    is a strict superset of what the continuation paths keep.)
++        commit_sequence_kv(sequence, E,
++                           speculative_backend == SpeculativeBackend::Mtp
++                               ? backend_frontier_at(speculative_backend, E)
++                               : 0U);
++        sequence.text_kv_valid = E;
++        if (speculative_backend == SpeculativeBackend::Mtp) {
++            sequence.mtp_kv_valid = backend_frontier_at(speculative_backend, E);
++        }
++        staged.base           = E;
++        staged.cursor         = E;
++        staged.advertised_base = E;
++        const double restore_seconds =
++            std::chrono::duration<double>(Clock::now() - restore_started).count();
++        fprintf(stderr,
++                "[l3-restore] seq lane=%u prompt=%u frontier=%u (%u%%) pages=%u state=ok "
++                "elapsed=%.3fs recompute_tail=%u\n",
++                static_cast<unsigned>(sequence.lane), prompt_tokens, E,
++                100U * E / prompt_tokens, page_count, restore_seconds,
++                prompt_tokens - E);
++        return true;
++    }
++
+ qwen3_6::detail::PressureDecision
+ ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
+     qwen3_6::detail::PressureDecision option;
+@@ -4452,6 +5104,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+         materialization_identity_.assign(prompt);
+         materialization_prefix_digests_.assign(prompt);
+ 
++        // L3 (disk) tier — the admission probe already selected the restorable
++        // frontier E (inspect_lane, before the scheduler grant) and recorded it
++        // in plan.summary.reusable_prompt_tokens. Mirror it into the transaction
++        // so materialization seeds [0,E) from disk; if it fails, the prefill
++        // replays [0,E) unreported and the admission contract still holds.
++        if (disk_kv != nullptr && request_plan.reuse == ReusePath::Root) {
++            if (disk_kv_restore &&
++                (speculative_backend == SpeculativeBackend::None ||
++                 speculative_backend == SpeculativeBackend::Mtp) &&
++                disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
++                request_plan.reuse_base != 0 &&
++                request_plan.reuse_base < request_plan.summary.prompt_tokens) {
++                transaction.l3_restore_frontier = request_plan.reuse_base;
++            }
++            std::vector<DiskKVIdentity> probe_ids;
++            const std::uint32_t max_pages =
++                std::min<std::uint32_t>(kv_pages_for_frontier(prompt_tokens), 4096);
++            probe_ids.reserve(max_pages);
++            for (std::uint32_t p = 0; p < max_pages; ++p) {
++                // Write-side key for page p = digest of the page's LAST committed
++                // token: a full page keys at (p+1)*64, a partial last page keys
++                // at prompt_tokens. (All prompt pages are committed at admission.)
++                const std::uint32_t page_end    = (p + 1) * static_cast<std::uint32_t>(kPagedKVPageSize);
++                const std::uint32_t frontier = std::min(page_end, prompt_tokens);
++                if (frontier == 0 || frontier >= materialization_prefix_digests_.size()) { break; }
++                const auto digest = materialization_prefix_digests_.at(frontier);
++                probe_ids.push_back(DiskKVIdentity{.lo     = digest[0],
++                                                   .hi     = digest[1],
++                                                   .tag    = static_cast<std::uint32_t>(speculative_backend) |
++                                                             (static_cast<std::uint32_t>(proposal_head) << 8U) |
++                                                             (static_cast<std::uint32_t>(kv_storage) << 16U),
++                                                   .frontier = frontier});
++            }
++            const std::size_t hit_pages = disk_kv->probe_prefix(probe_ids, DiskKVKind::MainKV);
++            const std::uint32_t hit_tokens =
++                static_cast<std::uint32_t>(hit_pages * static_cast<std::size_t>(kPagedKVPageSize));
++            disk_kv->record_probe(prompt_tokens, hit_tokens);
++        }
++
+         const std::uint32_t initial_mtp_extent =
+             speculative_backend == SpeculativeBackend::Mtp
+                 ? std::min({draft_window,
+@@ -4465,8 +5156,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+             .vision_plan        = std::move(request_plan.vision),
+             .vision             = nullptr,
+             .capture_groups     = std::move(request_plan.capture_groups),
+-            .base               = request_plan.reuse_base,
+-            .cursor             = request_plan.reuse_base,
++            // Root physically starts at zero (fresh device KV, full prompt
++            // recomputed or disk-seeded); only the L3 accounting advertises E.
++            // Non-Root paths keep reuse_base — their device KV really is valid
++            // up to it (trim below requires committed >= base).
++            .base               = request_plan.reuse == ReusePath::Root
++                                      ? 0U : request_plan.reuse_base,
++            .cursor             = request_plan.reuse == ReusePath::Root
++                                      ? 0U : request_plan.reuse_base,
+             .prompt_tokens      = prompt_tokens,
+             .initial_mtp_extent = initial_mtp_extent,
+             .elapsed_seconds    = 0.0,
+@@ -7074,6 +7771,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
+     out.processed_prompt_tokens = step.processed_prompt_tokens;
+     out.complete                = step.complete;
+     out.timing                  = step.timing;
++    out.next_token_top_logprobs = std::move(step.next_token_top_logprobs);
+     if (step.complete) {
+         const std::array<std::uint32_t, 1> lanes{lane};
+         const runtime::BatchedGeneratedRound round{
+@@ -9905,7 +10603,21 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
+             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
+                                                                 : 0U;
+         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
++        // L3 (disk) tier — read side: if the admission probe marked a restorable
++        // boundary E, seed the freshly created device pages [0,E) and the GDN
++        // state image from disk and start prefill at E (only [E, prompt) is
++        // recomputed). Any failure keeps the clean full-recompute state
++        // (hard fallback: never worse than today's Root behavior).
++        // The admission contract was built on E (reusable_prompt_tokens = E),
++        // independent of seed success — advertise E up front so the prefill
++        // summary always matches the committed admission BeginSummary.
++        if (transaction.l3_restore_frontier &&
++            *transaction.l3_restore_frontier < prompt_tokens) {
++            staged.advertised_base = *transaction.l3_restore_frontier;
++        }
++        (void)restore_root_from_disk(sequence, transaction, staged, prompt_tokens);
+         install_sampling(sequence, request, request_plan.sampling);
++        request.top_logprobs = request_plan.top_logprobs;
+         sequence.rope_delta = staged.prompt.rope_delta;
+         set_device_i32(io.rope_delta, sequence.rope_delta);
+ 
+@@ -10847,6 +11559,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+     if (!sequence.kv || !text_kv_addresses || !text_kv_addresses->can_release(sequence.kv->text)) {
+         std::terminate();
+     }
++    spill_dying_owner_pages(sequence);  // before any release: pages must be readable
+     if (sequence.kv->backend &&
+         (!backend_kv_addresses || !backend_kv_addresses->can_release(*sequence.kv->backend))) {
+         std::terminate();
+@@ -10861,6 +11574,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+ 
+ void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
+     if (!sequence.kv) { return; }
++    spill_dying_owner_pages(sequence);  // before any release: pages must be readable
+     unbind_sequence_kv(sequence);
+     if (sequence.kv->backend && backend_kv_addresses) {
+         (void)backend_kv_addresses->release(*sequence.kv->backend);
+@@ -11388,6 +12102,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
+     }
+ }
+ 
++namespace {
++
++// Exact full-vocabulary softmax + top-K over one staged next-token logit row (BF16).
++// CPU-only, called once per exported request after the prefill step synchronized. The
++// probabilities are the raw model distribution (no sampling temperature/penalties).
++std::optional<std::vector<::ninfer::TopLogprob>>
++compute_next_token_top_logprobs(const void* logits_host, std::uint32_t top_k) {
++    constexpr std::size_t vocab = TextConfig::token_domain;
++    const std::size_t k = std::min<std::size_t>(top_k, vocab);
++    if (k == 0) { return std::nullopt; }
++    const auto* raw = static_cast<const std::uint16_t*>(logits_host);
++    std::vector<float> z(vocab);
++    float z_max = -std::numeric_limits<float>::infinity();
++    for (std::size_t i = 0; i < vocab; ++i) {
++        // BF16 is the high 16 bits of the same float32 bit pattern.
++        const std::uint32_t packed = static_cast<std::uint32_t>(raw[i]) << 16;
++        std::memcpy(&z[i], &packed, sizeof(float));
++        z_max = std::max(z_max, z[i]);
++    }
++    double denominator = 0.0;
++    for (std::size_t i = 0; i < vocab; ++i) {
++        z[i] = std::exp(z[i] - z_max);
++        denominator += z[i];
++    }
++    std::vector<std::size_t> order(vocab);
++    std::iota(order.begin(), order.end(), 0);
++    std::partial_sort(order.begin(), order.begin() + k, order.end(),
++                      [&z](std::size_t a, std::size_t b) { return z[a] > z[b]; });
++    std::vector<::ninfer::TopLogprob> out;
++    out.reserve(k);
++    for (std::size_t i = 0; i < k; ++i) {
++        out.push_back(::ninfer::TopLogprob{
++            .token_id    = static_cast<std::uint32_t>(order[i]),
++            .probability = static_cast<float>(z[order[i]] / denominator)});
++    }
++    return out;
++}
++
++} // namespace
++
+ runtime::PrefillStepResult
+ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
+                                  runtime::ExecutionTiming* failed_timing) {
+@@ -11400,10 +12154,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+     if (staged.pending_capture_offer != 0) {
+         throw std::logic_error("prefill cannot advance while a capture offer is pending");
+     }
+-    const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
+-                                        .reused_prompt_tokens = staged.base,
+-                                        .prefix_reuse_path    = staged.reuse};
++    const runtime::BeginSummary summary{
++        .prompt_tokens        = staged.prompt_tokens,
++        // L3 (disk) restore: on the Root path the admission contract was built
++        // on advertised_base (the probe-selected frontier E) — report it there.
++        // Every other reuse path (PrivateEndpoint, shared, rewrite restore)
++        // keeps reporting staged.base, the reuse admission actually granted.
++        .reused_prompt_tokens =
++            staged.reuse == ReusePath::Root ? staged.advertised_base : staged.base,
++        .prefix_reuse_path    = staged.reuse};
++    // L3 (disk) restore: a failed seed keeps the admission contract (reusable =
++    // advertised_base = E) while the prefill physically recomputes [0, E).
++    // Those replayed tokens are engine-invisible at every reported step, so
++    // engine's per-step invariant processed <= suffix - computed holds.
++    const std::uint32_t replay_hidden =
++        (staged.base == 0 && staged.advertised_base > staged.base ? staged.advertised_base : 0U);
+     std::uint32_t processed_prompt_tokens = 0;
++    // Engine-visible processed tokens: with a failed seed the [0, E) replay is
++    // admission-precounted (reusable = E) and must never be reported as work.
++    const auto reported_processed = [&processed_prompt_tokens, replay_hidden] {
++        return processed_prompt_tokens > replay_hidden ? processed_prompt_tokens - replay_hidden
++                                                       : 0U;
++    };
+     const auto started                    = Clock::now();
+     try {
+         if (staged.next_capture < staged.capture_groups.size() &&
+@@ -11428,10 +12200,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
+             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
+         }
++        // Next-token distribution export: the final prefill sample stages the raw logit row
++        // into this pinned buffer (async, same stream, before any MTP bridge overwrites it).
++        void* next_token_capture = nullptr;
++        if (request.top_logprobs && *request.top_logprobs > 0) {
++            if (!top_logprobs_host) {
++                top_logprobs_host.emplace(TextConfig::token_domain * sizeof(std::uint16_t));
++            }
++            next_token_capture = top_logprobs_host->data();
++        }
+         schedule::PrefillContext schedule_state{
+             {device, model, work, state_images->linear(),
+              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+-             proposal_head},
++             proposal_head, next_token_capture},
+             text_kv_view(sequence),
+             mtp_kv_view(sequence),
+             decoder->text_kv,
+@@ -11559,7 +12340,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+                         staged.pending_capture_offer = next_capture_offer_id_;
+                         return runtime::PrefillStepResult{
+                             .summary                 = summary,
+-                            .processed_prompt_tokens = processed_prompt_tokens,
++                            .processed_prompt_tokens = reported_processed(),
+                             .timing                  = timing.finish(),
+                         };
+                     }
+@@ -11577,7 +12358,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+                     std::chrono::duration<double>(Clock::now() - started).count();
+                 return runtime::PrefillStepResult{
+                     .summary                 = summary,
+-                    .processed_prompt_tokens = processed_prompt_tokens,
++                    .processed_prompt_tokens = reported_processed(),
+                     .timing                  = timing.finish(),
+                 };
+             }
+@@ -11624,6 +12405,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+         timing.begin_wait();
+         device.synchronize();
+         timing.end_wait();
++        std::optional<std::vector<::ninfer::TopLogprob>> next_token_top_logprobs;
++        if (next_token_capture != nullptr) {
++            next_token_top_logprobs =
++                compute_next_token_top_logprobs(next_token_capture, *request.top_logprobs);
++        }
+         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
+         const std::uint32_t prompt_tokens = staged.prompt_tokens;
+@@ -11653,7 +12439,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+         staged.prompt.release_all_media_payloads();
+         if (staged.vision) { staged.vision->retire_handoff(); }
+-
+         const bool prompt_frontier_capture =
+             staged.next_capture < staged.capture_groups.size() &&
+             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
+@@ -11667,9 +12452,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+         return runtime::PrefillStepResult{
+             .summary = summary,
+             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
+-            .processed_prompt_tokens = processed_prompt_tokens,
++            .processed_prompt_tokens = reported_processed(),
+             .complete                = true,
+             .timing                  = timing.finish(),
++            .next_token_top_logprobs = std::move(next_token_top_logprobs),
+         };
+     } catch (...) {
+         timing.begin_wait();
+diff --git a/src/targets/qwen3_6/impl/runtime/request_plan_impl.h b/src/targets/qwen3_6/impl/runtime/request_plan_impl.h
+index 1b04d8dd..89190f9b 100644
+--- a/src/targets/qwen3_6/impl/runtime/request_plan_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/request_plan_impl.h
+@@ -260,6 +260,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
+                                                ? FinishReason::OutputLimit
+                                                : FinishReason::ContextCapacity;
+     base->sampling                       = translate_sampling(options.sampling);
++    base->top_logprobs                   = options.top_logprobs;
+     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+     base->summary.publish_continuation =
+         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+@@ -459,6 +460,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
+     auto plan                         = std::make_unique<AdmissionCandidateImpl>();
+     plan->summary                     = base.summary;
+     plan->sampling                    = base.sampling;
++    plan->top_logprobs                = base.top_logprobs;
+     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
+     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+     plan->root_rebuild_work           = base.root_rebuild_work;
+@@ -730,9 +732,170 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
+     }
+ 
+     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
++    // L3 (disk) tier read-side admission probe. A Root request with no resident
++    // prefix may still have its whole prompt-prefix restorable from disk (dead
++    // session returning after restart). Probe here — BEFORE the scheduler grant
++    // is issued — so the restorable frontier E enters the admission accounting
++    // (reusable_prompt_tokens) and the engine's prefill contract matches what
++    // materialization will actually do (seed device KV [0,E), recompute [E,prompt)).
++    // Failure to seed later keeps the accounting (the prefill then recomputes the
++    // [0,E) segment as an unreported replay; the engine-visible contract holds).
++    if (plan->reuse == ReusePath::Root && disk_kv != nullptr && disk_kv_restore) {
++        fprintf(stderr, "[l3-probe] enter src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u\n",
++                static_cast<int>(source != nullptr), static_cast<int>(shared_source != nullptr),
++                static_cast<int>(speculative_backend),
++                static_cast<int>(base.summary.publish_continuation),
++                disk_kv->slot_count(DiskKVKind::StateImage),
++                base.prefix_digests.size(), plan->summary.prompt_tokens);
++    }
++    if (plan->reuse == ReusePath::Root && source == nullptr && shared_source == nullptr &&
++        disk_kv != nullptr && disk_kv_restore &&
++        (speculative_backend == SpeculativeBackend::None ||
++         speculative_backend == SpeculativeBackend::Mtp) &&
++        base.summary.publish_continuation &&
++        disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
++        base.prefix_digests.size() >= plan->summary.prompt_tokens &&
++        plan->summary.prompt_tokens != 0) {
++        const std::uint32_t tag = capture_identity_tag(speculative_backend, proposal_head,
++                                                       kv_storage);
++        std::optional<std::uint32_t> best_E;
++        for (const std::uint32_t E : disk_kv->live_state_frontiers()) {
++            if (E == 0) { continue; }
++            if (E >= plan->summary.prompt_tokens) {
++                fprintf(stderr, "[l3-probe] E=%u >= prompt=%u skip\n", E,
++                        plan->summary.prompt_tokens);
++                continue;
++            }
++            const std::uint32_t full_pages = E / static_cast<std::uint32_t>(kPagedKVPageSize);
++            bool covered = full_pages != 0;
++            std::uint32_t fail_key = 0;
++            if (covered) {
++                for (std::uint32_t p = 0; p < full_pages && covered; ++p) {
++                    const auto digest = base.prefix_digests.at((p + 1) *
++                        static_cast<std::uint32_t>(kPagedKVPageSize));
++                    const DiskKVIdentity id{.lo       = digest[0],
++                                            .hi       = digest[1],
++                                            .tag      = tag,
++                                            .frontier = (p + 1) *
++                                                        static_cast<std::uint32_t>(kPagedKVPageSize)};
++                    if (!disk_kv->contains(id, DiskKVKind::MainKV)) {
++                        covered  = false;
++                        fail_key = id.frontier;
++                    }
++                }
++            }
++            if (!covered) {
++                fprintf(stderr, "[l3-probe] E=%u main chain miss key=%u\n", E, fail_key);
++                continue;
++            }
++            if (E % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
++                const auto digest = base.prefix_digests.at(E);
++                const DiskKVIdentity id{.lo       = digest[0],
++                                        .hi       = digest[1],
++                                        .tag      = tag,
++                                        .frontier = E};
++                if (!disk_kv->contains(id, DiskKVKind::MainKV) ||
++                    !disk_kv->contains(id, DiskKVKind::StateImage)) {
++                    fprintf(stderr, "[l3-probe] E=%u tail main=%d state=%d\n", E,
++                            static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
++                            static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
++                    continue;
++                }
++            } else {
++                const auto digest = base.prefix_digests.at(E);
++                const DiskKVIdentity id{.lo       = digest[0],
++                                        .hi       = digest[1],
++                                        .tag      = tag,
++                                        .frontier = E};
++                if (!disk_kv->contains(id, DiskKVKind::StateImage)) {
++                    fprintf(stderr, "[l3-probe] E=%u (aligned) state=0\n", E);
++                    continue;
++                }
++            }
++            if (speculative_backend == SpeculativeBackend::Mtp) {
++                // MTP draft KV is one token short of the main frontier.
++                const std::uint32_t bfrontier = backend_frontier_at(speculative_backend, E);
++                const std::uint32_t bfull_pages = bfrontier /
++                                                 static_cast<std::uint32_t>(kPagedKVPageSize);
++                bool backend_covered = true;
++                std::uint32_t bfail_key = 0;
++                for (std::uint32_t p = 0; p < bfull_pages && backend_covered; ++p) {
++                    const auto digest = base.prefix_digests.at((p + 1) *
++                        static_cast<std::uint32_t>(kPagedKVPageSize));
++                    const DiskKVIdentity id{.lo       = digest[0],
++                                            .hi       = digest[1],
++                                            .tag      = tag,
++                                            .frontier = (p + 1) *
++                                                        static_cast<std::uint32_t>(kPagedKVPageSize)};
++                    if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
++                        backend_covered = false;
++                        bfail_key       = id.frontier;
++                    }
++                }
++                if (backend_covered && bfrontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
++                    const auto digest = base.prefix_digests.at(bfrontier);
++                    const DiskKVIdentity id{.lo       = digest[0],
++                                            .hi       = digest[1],
++                                            .tag      = tag,
++                                            .frontier = bfrontier};
++                    if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
++                        backend_covered = false;
++                        bfail_key       = bfrontier;
++                    }
++                }
++                if (!backend_covered) {
++                    fprintf(stderr, "[l3-probe] E=%u backend miss bf=%u key=%u\n", E,
++                            bfrontier, bfail_key);
++                    continue;
++                }
++            }
++            if (!best_E || E > *best_E) { best_E = E; }
++        }
++        if (best_E) {
++            fprintf(stderr, "[l3-probe] best_E=%u\n", *best_E);
++            const std::uint32_t E = *best_E;
++            plan->reuse_base                     = E;
++            plan->summary.reusable_prompt_tokens = E;
++            // The capture groups / shared candidates above were filtered against
++            // reuse_base = 0 BEFORE this probe ran. Raising reuse_base to E makes
++            // every boundary at or inside [0, E] uncapturable (the prefix is
++            // reused wholesale); leaving them in trips the materialization
++            // validation ("planned capture identity is invalid").
++            plan->capture_groups.erase(
++                std::remove_if(plan->capture_groups.begin(), plan->capture_groups.end(),
++                               [E](const CaptureGroup& group) {
++                                   const bool base_shared_promotion =
++                                       group.frontier == E && group.shared && !group.rewrite &&
++                                       !group.long_anchor;
++                                   return group.frontier <= E && !base_shared_promotion;
++                               }),
++                plan->capture_groups.end());
++            plan->shared_candidates.erase(
++                std::remove_if(plan->shared_candidates.begin(), plan->shared_candidates.end(),
++                               [E](const CaptureGroup& group) { return group.frontier < E; }),
++                plan->shared_candidates.end());
++            // The frontend's reply-boundary rewrite checkpoint sits at the tail
++            // of the prompt (usually E or below it): replacing it requires a
++            // capture at that frontier, which no longer exists inside the reused
++            // prefix. Drop it — the L3 restore already delivers state [0, E).
++            if (base.rewrite_checkpoint &&
++                plan->rewrite_disposition ==
++                    RewriteCheckpointDisposition::ReplaceAtCommittedFrontier &&
++                base.rewrite_checkpoint->frontier <= E) {
++                plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
++            }
++        } else {
++            fprintf(stderr, "[l3-probe] no candidate passed\n");
++        }
++    }
+     plan->summary.service_work_quanta =
+-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
++        projected_service_work(plan->summary, 0, prefill_chunk, prefill_splits,
+                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
++    // L3 (disk) restore: quanta are booked for the FULL prompt (reuse_base = 0)
++    // because a failed disk seed physically recomputes [0, E) even though the
++    // admission contract counts E as reused. consume_service_work throws when
++    // a request is charged more quanta than it was granted; a successful seed
++    // simply leaves its unused quanta unspent.
+     std::uint64_t remaining_vision_items   = 0;
+     std::uint64_t remaining_vision_patches = 0;
+     if (plan->vision) {
+diff --git a/src/targets/qwen3_6/impl/runtime/schedule.h b/src/targets/qwen3_6/impl/runtime/schedule.h
+index c9dc6eeb..355eb60c 100644
+--- a/src/targets/qwen3_6/impl/runtime/schedule.h
++++ b/src/targets/qwen3_6/impl/runtime/schedule.h
+@@ -38,6 +38,9 @@ struct ExecutionCore {
+     Tensor& prefill_hidden;
+     std::uint32_t prefill_chunk;
+     ProposalHead proposal_head;
++    // When non-null: the first prefill sample additionally stages the raw next-token logit row
++    // (token_domain BF16) into this pinned host buffer, before any MTP bridge overwrites it.
++    void* next_token_logits_capture = nullptr;
+ };
+ 
+ struct PrefillContext {
+diff --git a/src/targets/qwen3_6/impl/runtime/state_image_store.h b/src/targets/qwen3_6/impl/runtime/state_image_store.h
+index 16ef31f8..2653bcd2 100644
+--- a/src/targets/qwen3_6/impl/runtime/state_image_store.h
++++ b/src/targets/qwen3_6/impl/runtime/state_image_store.h
+@@ -197,6 +197,16 @@ public:
+         return StateReplicaResidency::None;
+     }
+ 
++    // Read-only access to this handle's host replica bytes (whole image_bytes
++    // block). Used by the disk-tier spill to copy the GDN/hidden state image
++    // to L3. Returns nullopt when the image is not currently host-resident.
++    [[nodiscard]] std::optional<qwen3_6::HostStateImageConstView> host_view(
++        StateImageHandle handle) const {
++        const Object& object = require(handle);
++        if (host_ == nullptr || !object.host_slot) { return std::nullopt; }
++        return host_->view(*object.host_slot);
++    }
++
+     [[nodiscard]] std::uint64_t content_epoch(StateImageHandle handle) const {
+         return require(handle).content_epoch;
+     }
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context.h b/src/targets/qwen3_6/impl/runtime/text_context.h
+index 09eb0e18..44c98c51 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context.h
+@@ -171,6 +171,12 @@ public:
+ 
+     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+ 
++    // Opt-in next-token distribution export: when set, the final prefill chunk stages the raw
++    // next-token logit row into this caller-owned pinned host buffer right after sampling.
++    void set_next_token_logits_capture(void* capture) noexcept {
++        next_token_logits_capture_ = capture;
++    }
++
+     void set_prefill_split_frontier(std::int64_t position) noexcept {
+         prefill_split_frontier_ = position;
+     }
+@@ -325,6 +331,7 @@ private:
+     const std::int32_t* proposal_head_ids_      = nullptr;
+     int proposal_head_n_                        = 0;
+     const ops::SamplingConfig* sampling_config_ = nullptr;
++    void* next_token_logits_capture_            = nullptr;
+     MtpW mtp_;
+     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
+     std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index e6f99f8d..5cbc1ec9 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -1206,6 +1206,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
+                 } else {
+                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
+                 }
++                // Next-token distribution export: stage the raw logit row into the request's
++                // pinned host buffer before the MTP proposal step reuses io_.logits. Stream
++                // ordering guarantees this copy reads the prefill logits.
++                if (next_token_logits_capture_ != nullptr) {
++                    CUDA_CHECK(cudaMemcpyAsync(next_token_logits_capture_, logits.data,
++                                               kCfg.token_domain * sizeof(std::uint16_t),
++                                               cudaMemcpyDeviceToHost, s));
++                }
+             }
+ 
+             if (prepare_mtp_prompt) {
+diff --git a/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h b/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
+index 40ccda9d..4030d70a 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_prefill_impl.h
+@@ -36,6 +36,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
+                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
+                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+     card.set_sampling(sampling);
++    card.set_next_token_logits_capture(execution.next_token_logits_capture);
+     card.set_linear_state_slots(state_source_slot, state_destination_slot);
+     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
+     card.set_mtp_proposal_extent(mtp_proposal_extent);
+@@ -143,6 +144,13 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
+     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
+                 state.execution.io.pos, purpose, state.execution.work,
+                 state.execution.device.stream);
++    // Next-token distribution export (zero-suffix reuse path): stage the raw logit row before
++    // any MTP bridge overwrites io.logits.
++    if (state.execution.next_token_logits_capture != nullptr) {
++        CUDA_CHECK(cudaMemcpyAsync(state.execution.next_token_logits_capture, logits.data,
++                                   TextConfig::token_domain * sizeof(std::uint16_t),
++                                   cudaMemcpyDeviceToHost, state.execution.device.stream));
++    }
+     state.execution.work.reset();
+ }
+ 
