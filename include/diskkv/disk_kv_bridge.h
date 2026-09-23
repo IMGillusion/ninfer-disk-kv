@@ -174,6 +174,11 @@ private:
     Family families_[3];
     mutable std::mutex mu_;   // guards stats (stores are self-locked)
     mutable DiskKVBridgeStats stats_;
+    // Index-durability batching: the DATA slots are self-describing (magic +
+    // identity + CRC) and the store rebuilds a missing index by scanning them,
+    // so an atomic index rewrite per page is pure overhead (a crash loses at
+    // most the last batch — the scan recovers the durable slots).
+    std::uint32_t flush_pending_ = 0;
     // Bounded async spill queue + writer thread.
     std::mutex qmu_;
     std::condition_variable qcv_;

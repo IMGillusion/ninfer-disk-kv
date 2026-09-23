@@ -14,6 +14,10 @@
 #include <stdexcept>
 #include <system_error>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <nmmintrin.h>  // _mm_crc32_u8/u64 (SSE4.2, hardware CRC32C)
+#endif
+
 namespace ninfer {
 namespace {
 
@@ -43,9 +47,47 @@ const CrcTable& crc_table() {
     return tbl;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("sse4.2")))
+#endif
+std::uint32_t crc32c_hw_run(std::uint32_t c, const std::byte* p, std::size_t n) noexcept {
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, p + i, 8);
+        c = static_cast<std::uint32_t>(_mm_crc32_u64(c, v));
+    }
+    for (; i < n; ++i) {
+        c = _mm_crc32_u8(c, static_cast<std::uint8_t>(p[i]));
+    }
+    return c;
+}
+
+bool crc32c_hw_available() noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    static const bool ok = (__builtin_cpu_supports("sse4.2") != 0);
+    return ok;
+#else
+    return true;  // MSVC x64: the intrinsic emits the instruction directly
+#endif
+}
+#endif
+
 } // namespace
 
 std::uint64_t DiskKVStore::crc32c(std::span<const std::byte> data) {
+    const std::byte* p = data.data();
+    const std::size_t n = data.size();
+#if defined(__x86_64__) || defined(_M_X64)
+    // Hardware CRC32C (SSE4.2) — same polynomial, ~20x the table speed. The
+    // table was the dominant cost of large spills/restores (~100 MB/s vs the
+    // NVMe's 3+ GB/s).
+    if (crc32c_hw_available()) {
+        return static_cast<std::uint64_t>(
+            crc32c_hw_run(0xFFFFFFFFu, p, n) ^ 0xFFFFFFFFu);
+    }
+#endif
     const auto& tbl = crc_table();
     std::uint32_t c = 0xFFFFFFFFu;
     for (const std::byte b : data) {

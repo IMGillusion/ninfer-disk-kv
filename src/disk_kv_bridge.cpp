@@ -89,11 +89,25 @@ DiskKVBridge::~DiskKVBridge() {
         }
         spill_queued(job);
     }
+    // Durability barrier before the stores go away (batched index updates).
+    flush_pending_ = 0;
+    for (Family& fam : families_) {
+        if (fam.store != nullptr) { fam.store->flush_index(); }
+    }
 }
 
 void DiskKVBridge::wait_idle() {
-    std::unique_lock<std::mutex> lock(qmu_);
-    qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
+    {
+        std::unique_lock<std::mutex> lock(qmu_);
+        qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
+    }
+    // Durability barrier: land any batched index updates.
+    if (flush_pending_ != 0) {
+        flush_pending_ = 0;
+        for (Family& fam : families_) {
+            if (fam.store != nullptr) { fam.store->flush_index(); }
+        }
+    }
 }
 
 void DiskKVBridge::worker_loop() {
@@ -118,6 +132,13 @@ void DiskKVBridge::worker_loop() {
         spill_queued(job);
         std::lock_guard<std::mutex> lock(qmu_);
         in_flight_ -= 1;
+        if (queue_.empty() && flush_pending_ != 0) {
+            // The burst drained: land the batched index updates while idle.
+            flush_pending_ = 0;
+            for (Family& fam : families_) {
+                if (fam.store != nullptr) { fam.store->flush_index(); }
+            }
+        }
         qcv_.notify_all();  // wait_idle may be waiting on the queue draining
     }
 }
@@ -179,7 +200,14 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     std::vector<std::uint32_t> evicted;
     std::span<const std::byte> bytes(job.bytes);
     if (!f.store->upsert_page(job.id, bytes, &evicted)) { return; }
-    f.store->flush_index();  // durability point for this page
+    // Batched index durability (see flush_pending_ in the header): a per-page
+    // atomic index rewrite dominated large owner-death sweeps.
+    if (++flush_pending_ >= 64) {
+        flush_pending_ = 0;
+        for (Family& fam : families_) {
+            if (fam.store != nullptr) { fam.store->flush_index(); }
+        }
+    }
     std::lock_guard<std::mutex> lock(mu_);
     stats_.spills += 1;
     stats_.spill_bytes += job.bytes.size();
