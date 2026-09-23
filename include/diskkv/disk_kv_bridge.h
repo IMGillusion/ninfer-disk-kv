@@ -124,6 +124,12 @@ public:
     [[nodiscard]] bool restore_page(const DiskKVIdentity& id, DiskKVKind kind,
                                     std::span<std::byte> dst) const;
 
+    /** Permanently drop a page that is indexed but unreadable (stale row,
+     *  failed CRC). Self-heal for the restore path: the probe's chain walk
+     *  rejects the frontier from then on, so one bad page can never wedge
+     *  more than a single request. */
+    bool drop_page(const DiskKVIdentity& id, DiskKVKind kind);
+
     /** True if this identity's page is restorable on disk right now. Cheap
      *  (header check). */
     [[nodiscard]] bool contains(const DiskKVIdentity& id, DiskKVKind kind) const;

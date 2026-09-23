@@ -236,6 +236,13 @@ bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
     return true;
 }
 
+bool DiskKVBridge::drop_page(const DiskKVIdentity& id, DiskKVKind kind) {
+    if (!enabled_) { return false; }
+    Family& f = family(kind);
+    if (f.store == nullptr) { return false; }
+    return f.store->evict(id);
+}
+
 bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
                                 std::span<std::byte> dst) const {
     if (!enabled_) { return false; }

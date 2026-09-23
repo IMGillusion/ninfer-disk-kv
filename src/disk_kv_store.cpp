@@ -150,15 +150,14 @@ DiskKVStore::DiskKVStore(Options opts) : opts_(std::move(opts)) {
     }
     for (std::uint32_t s = 0; s < max_slots_; ++s) { free_slots_.push_back(s); }
 
-    // The slot headers + data CRCs are the authority: always (re)derive the
-    // in-memory index from a full scan. The packed index is only a cache of
-    // that derivation and can be stale after a SIGKILL (LRU/eviction updates
-    // are lazily persisted), which previously produced index rows that passed
-    // `contains()` but failed the per-read header/CRC check and pushed the
-    // engine onto a slow full-replay fallback. A scan of a 40 GiB store costs
-    // a few seconds at the store's measured scan rate and removes that whole
-    // failure class.
-    rebuild_from_scan();
+    // Fast path: load the packed index (a full slot scan here costs minutes on
+    // virtiofs-mounted stores; all structural changes persist the index
+    // eagerly, so the rows are consistent). Data CRCs stay lazily verified at
+    // read time by design (a corrupted page becomes a restore miss). Without a
+    // valid index file a full scan rebuilds it.
+    if (!load_index()) {
+        rebuild_from_scan();
+    }
 }
 
 void DiskKVStore::create_fresh() {

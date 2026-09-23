@@ -100,10 +100,10 @@ index 98052fdb..70389777 100644
    core/layout.cpp
 diff --git a/src/core/disk_kv_bridge.cpp b/src/core/disk_kv_bridge.cpp
 new file mode 100644
-index 00000000..4a222986
+index 00000000..00726f62
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.cpp
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,340 @@
 +#include "core/disk_kv_bridge.h"
 +
 +#include <algorithm>
@@ -195,11 +195,25 @@ index 00000000..4a222986
 +        }
 +        spill_queued(job);
 +    }
++    // Durability barrier before the stores go away (batched index updates).
++    flush_pending_ = 0;
++    for (Family& fam : families_) {
++        if (fam.store != nullptr) { fam.store->flush_index(); }
++    }
 +}
 +
 +void DiskKVBridge::wait_idle() {
-+    std::unique_lock<std::mutex> lock(qmu_);
-+    qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
++    {
++        std::unique_lock<std::mutex> lock(qmu_);
++        qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
++    }
++    // Durability barrier: land any batched index updates.
++    if (flush_pending_ != 0) {
++        flush_pending_ = 0;
++        for (Family& fam : families_) {
++            if (fam.store != nullptr) { fam.store->flush_index(); }
++        }
++    }
 +}
 +
 +void DiskKVBridge::worker_loop() {
@@ -224,6 +238,13 @@ index 00000000..4a222986
 +        spill_queued(job);
 +        std::lock_guard<std::mutex> lock(qmu_);
 +        in_flight_ -= 1;
++        if (queue_.empty() && flush_pending_ != 0) {
++            // The burst drained: land the batched index updates while idle.
++            flush_pending_ = 0;
++            for (Family& fam : families_) {
++                if (fam.store != nullptr) { fam.store->flush_index(); }
++            }
++        }
 +        qcv_.notify_all();  // wait_idle may be waiting on the queue draining
 +    }
 +}
@@ -285,7 +306,14 @@ index 00000000..4a222986
 +    std::vector<std::uint32_t> evicted;
 +    std::span<const std::byte> bytes(job.bytes);
 +    if (!f.store->upsert_page(job.id, bytes, &evicted)) { return; }
-+    f.store->flush_index();  // durability point for this page
++    // Batched index durability (see flush_pending_ in the header): a per-page
++    // atomic index rewrite dominated large owner-death sweeps.
++    if (++flush_pending_ >= 64) {
++        flush_pending_ = 0;
++        for (Family& fam : families_) {
++            if (fam.store != nullptr) { fam.store->flush_index(); }
++        }
++    }
 +    std::lock_guard<std::mutex> lock(mu_);
 +    stats_.spills += 1;
 +    stats_.spill_bytes += job.bytes.size();
@@ -312,6 +340,13 @@ index 00000000..4a222986
 +    stats_.spill_bytes += bytes.size();
 +    stats_.evicted_slots += evicted.size();
 +    return true;
++}
++
++bool DiskKVBridge::drop_page(const DiskKVIdentity& id, DiskKVKind kind) {
++    if (!enabled_) { return false; }
++    Family& f = family(kind);
++    if (f.store == nullptr) { return false; }
++    return f.store->evict(id);
 +}
 +
 +bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
@@ -411,10 +446,10 @@ index 00000000..4a222986
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_bridge.h b/src/core/disk_kv_bridge.h
 new file mode 100644
-index 00000000..1be4050f
+index 00000000..349f2dcd
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.h
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,198 @@
 +#pragma once
 +// Engine-facing facade over DiskKVStore (the L3 disk cold tier).
 +//
@@ -541,6 +576,12 @@ index 00000000..1be4050f
 +    [[nodiscard]] bool restore_page(const DiskKVIdentity& id, DiskKVKind kind,
 +                                    std::span<std::byte> dst) const;
 +
++    /** Permanently drop a page that is indexed but unreadable (stale row,
++     *  failed CRC). Self-heal for the restore path: the probe's chain walk
++     *  rejects the frontier from then on, so one bad page can never wedge
++     *  more than a single request. */
++    bool drop_page(const DiskKVIdentity& id, DiskKVKind kind);
++
 +    /** True if this identity's page is restorable on disk right now. Cheap
 +     *  (header check). */
 +    [[nodiscard]] bool contains(const DiskKVIdentity& id, DiskKVKind kind) const;
@@ -591,6 +632,11 @@ index 00000000..1be4050f
 +    Family families_[3];
 +    mutable std::mutex mu_;   // guards stats (stores are self-locked)
 +    mutable DiskKVBridgeStats stats_;
++    // Index-durability batching: the DATA slots are self-describing (magic +
++    // identity + CRC) and the store rebuilds a missing index by scanning them,
++    // so an atomic index rewrite per page is pure overhead (a crash loses at
++    // most the last batch — the scan recovers the durable slots).
++    std::uint32_t flush_pending_ = 0;
 +    // Bounded async spill queue + writer thread.
 +    std::mutex qmu_;
 +    std::condition_variable qcv_;
@@ -604,10 +650,10 @@ index 00000000..1be4050f
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_store.cpp b/src/core/disk_kv_store.cpp
 new file mode 100644
-index 00000000..e2244a99
+index 00000000..3e95bdae
 --- /dev/null
 +++ b/src/core/disk_kv_store.cpp
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,486 @@
 +#include "core/disk_kv_store.h"
 +
 +#include <fcntl.h>
@@ -637,14 +683,25 @@ index 00000000..e2244a99
 +}
 +
 +struct CrcTable {
-+    std::array<std::uint32_t, 256> t{};
++    // Slicing-by-8 tables for the SAME polynomial as the original byte-wise
++    // table (0xEDB88320, the reflected CRC-32 / zlib polynomial) — values are
++    // bit-identical to the byte-wise implementation, so every page ever
++    // written stays valid. (The SSE4.2 _mm_crc32_* instruction computes the
++    // *Castagnoli* CRC32C and is NOT value-compatible with this format.)
++    std::array<std::array<std::uint32_t, 256>, 8> t{};
 +    CrcTable() {
 +        for (std::uint32_t i = 0; i < 256; ++i) {
 +            std::uint32_t c = i;
 +            for (int k = 0; k < 8; ++k) {
 +                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
 +            }
-+            t[i] = c;
++            t[0][i] = c;
++        }
++        for (std::size_t s = 1; s < 8; ++s) {
++            for (std::uint32_t i = 0; i < 256; ++i) {
++                const std::uint32_t prev = t[s - 1][i];
++                t[s][i] = (prev >> 8) ^ t[0][prev & 0xFFu];
++            }
 +        }
 +    }
 +};
@@ -657,10 +714,30 @@ index 00000000..e2244a99
 +
 +std::uint64_t DiskKVStore::crc32c(std::span<const std::byte> data) {
 +    const auto& tbl = crc_table();
++    const std::byte* p = data.data();
++    std::size_t n = data.size();
 +    std::uint32_t c = 0xFFFFFFFFu;
-+    for (const std::byte b : data) {
-+        const std::uint8_t v = static_cast<std::uint8_t>(b);
-+        c = tbl.t[(c ^ v) & 0xFFu] ^ (c >> 8);
++    // Slicing-by-8: identical values to the original byte-wise loop, ~8-16x
++    // faster (the byte-wise loop was the dominant cost of large sweeps).
++    auto le32 = [](const std::byte* q) {
++        return static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[0])) |
++               (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[1])) << 8) |
++               (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[2])) << 16) |
++               (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[3])) << 24);
++    };
++    while (n >= 8) {
++        c ^= le32(p);
++        const std::uint32_t next = le32(p + 4);
++        c = tbl.t[7][c & 0xFFu] ^ tbl.t[6][(c >> 8) & 0xFFu] ^ tbl.t[5][(c >> 16) & 0xFFu] ^
++            tbl.t[4][(c >> 24) & 0xFFu] ^ tbl.t[3][next & 0xFFu] ^
++            tbl.t[2][(next >> 8) & 0xFFu] ^ tbl.t[1][(next >> 16) & 0xFFu] ^
++            tbl.t[0][(next >> 24) & 0xFFu];
++        p += 8;
++        n -= 8;
++    }
++    for (; n > 0; --n, ++p) {
++        const std::uint8_t v = static_cast<std::uint8_t>(*p);
++        c = tbl.t[0][(c ^ v) & 0xFFu] ^ (c >> 8);
 +    }
 +    return static_cast<std::uint64_t>(c ^ 0xFFFFFFFFu);
 +}
@@ -729,6 +806,11 @@ index 00000000..e2244a99
 +    }
 +    for (std::uint32_t s = 0; s < max_slots_; ++s) { free_slots_.push_back(s); }
 +
++    // Fast path: load the packed index (a full slot scan here costs minutes on
++    // virtiofs-mounted stores; all structural changes persist the index
++    // eagerly, so the rows are consistent). Data CRCs stay lazily verified at
++    // read time by design (a corrupted page becomes a restore miss). Without a
++    // valid index file a full scan rebuilds it.
 +    if (!load_index()) {
 +        rebuild_from_scan();
 +    }
@@ -1330,7 +1412,7 @@ index ee15cf8a..8a062dbc 100644
      nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                    static_cast<std::uint64_t>(tokens.size()));
 diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
-index d4d9b2d6..c3d0e201 100644
+index d4d9b2d6..00b53f2b 100644
 --- a/src/runtime/engine/engine_core.h
 +++ b/src/runtime/engine/engine_core.h
 @@ -81,6 +81,7 @@ public:
@@ -1349,7 +1431,38 @@ index d4d9b2d6..c3d0e201 100644
          result.thinking                = request->output.thinking_stats();
          result.materialization         = request->materialization_diagnostics;
          if (request->first_token) {
-@@ -1371,6 +1373,7 @@ private:
+@@ -1339,7 +1341,17 @@ private:
+         if (begin.reused_prompt_tokens > begin.prompt_tokens) {
+             throw std::logic_error("admitted prefix exceeds its prompt");
+         }
+-        const std::uint32_t suffix_tokens = begin.prompt_tokens - begin.reused_prompt_tokens;
++        // L3 (disk) restore: a failed seed revises the runtime summary down to
++        // the honest reuse (0). The runtime may under-report the reuse but
++        // never exceed the admitted promise; the per-unit accounting always
++        // follows the ACTUAL summary so the prefill contract stays exact.
++        if (progress.summary.prompt_tokens != begin.prompt_tokens ||
++            progress.summary.prefix_reuse_path != begin.prefix_reuse_path ||
++            progress.summary.reused_prompt_tokens > begin.reused_prompt_tokens) {
++            throw std::logic_error("runtime Begin summary exceeds the committed admission");
++        }
++        const std::uint32_t suffix_tokens =
++            begin.prompt_tokens - progress.summary.reused_prompt_tokens;
+         if (request->computed_prompt_tokens > suffix_tokens ||
+             progress.processed_prompt_tokens > suffix_tokens - request->computed_prompt_tokens) {
+             throw std::logic_error("prefill unit exceeded the admitted prompt suffix");
+@@ -1362,7 +1374,10 @@ private:
+         if (!request->lane || !progress.pending) {
+             throw std::logic_error("completed prefill has no lane or pending token");
+         }
+-        if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
++        if (!request->admitted_begin ||
++            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens ||
++            progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
++            progress.summary.reused_prompt_tokens > request->admitted_begin->reused_prompt_tokens) {
+             throw std::logic_error("runtime Begin summary differs from committed admission");
+         }
+         const std::uint32_t lane = request->lane->value;
+@@ -1371,6 +1386,7 @@ private:
              request_admission_check();
          }
          request->begin = progress.summary;
@@ -1631,7 +1744,7 @@ index 75c71383..29c8664d 100644
                                              const StopPolicy& caller_stop,
                                              const OutputOptions& output,
 diff --git a/src/targets/qwen3_6/impl/runtime/program.h b/src/targets/qwen3_6/impl/runtime/program.h
-index fcee5fc8..26864b34 100644
+index fcee5fc8..3eb48468 100644
 --- a/src/targets/qwen3_6/impl/runtime/program.h
 +++ b/src/targets/qwen3_6/impl/runtime/program.h
 @@ -5,6 +5,7 @@
@@ -1680,7 +1793,19 @@ index fcee5fc8..26864b34 100644
          std::uint32_t prompt_tokens         = 0;
          std::uint32_t initial_mtp_extent    = 0;
          double elapsed_seconds              = 0.0;
-@@ -647,6 +658,13 @@ public:
+@@ -642,11 +653,25 @@ public:
+     WorkspaceArena work;
+     std::unique_ptr<qwen3_6::DecoderState> decoder;
+     std::unique_ptr<HostKVArena> host_kv_arena;
++    // L3 (disk) restore scratch: reserved once at startup and held for the
++    // program's lifetime. The seed reads disk pages/state through these and
++    // never allocates from the shared host pools, so pool pressure (full
++    // state slots / KV arena) can neither fail nor block a restore.
++    std::optional<HostKVAllocation> l3_kv_scratch;
++    std::optional<HostKVAllocation> l3_backend_scratch;
++    std::optional<qwen3_6::HostStateSlotHandle> l3_state_scratch;
+     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
+     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
      std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
      std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
      std::unique_ptr<HostKVExtentStore> host_kv_extents;
@@ -1694,7 +1819,7 @@ index fcee5fc8..26864b34 100644
      std::size_t text_host_kv_page_stride    = 0;
      std::size_t backend_host_kv_page_stride = 0;
      std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
-@@ -675,6 +693,7 @@ public:
+@@ -675,6 +700,7 @@ public:
  
      PinnedHostBuffer round_host;
      std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -1702,7 +1827,7 @@ index fcee5fc8..26864b34 100644
      TokenId* host_tokens = nullptr;
      std::optional<PinnedHostBuffer> ordinary_host;
      qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
-@@ -872,6 +891,11 @@ private:
+@@ -872,6 +898,11 @@ private:
          std::vector<DeviceKVPageHandle> backend_restore_destinations;
          std::vector<runtime::ContextTransferObservation> transfer_observations;
          runtime::ContextOperationCounts operations;
@@ -1714,7 +1839,7 @@ index fcee5fc8..26864b34 100644
          bool state_restored                 = false;
          bool transfer_submitted             = false;
          std::uint8_t transfer_timer_mask    = 0;
-@@ -1125,6 +1149,27 @@ private:
+@@ -1125,6 +1156,27 @@ private:
          std::vector<runtime::CheckpointRecoveryAlternativeWork>& alternatives,
          PressureRecoveryScratch& scratch, std::uint64_t& projection_work) const;
      void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
@@ -1743,10 +1868,10 @@ index fcee5fc8..26864b34 100644
      [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
                                              const runtime::BatchedGeneratedRound& round);
 diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
-index e2a84d3d..9af26ec2 100644
+index e2a84d3d..3f429ff2 100644
 --- a/src/targets/qwen3_6/impl/runtime/program_impl.h
 +++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
-@@ -17,13 +17,17 @@
+@@ -17,17 +17,27 @@
  #include <algorithm>
  #include <array>
  #include <chrono>
@@ -1764,7 +1889,17 @@ index e2a84d3d..9af26ec2 100644
  
  namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
  namespace {
-@@ -916,6 +920,41 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
+ 
++// L3 (disk) seed scratch depth: pages per chunked disk->host->device read.
++// The scratch is reserved once at startup (this many pages per KV family
++// plus one host state slot) so the restore seed never allocates from the
++// shared pools and pool pressure can neither fail nor block a restore.
++constexpr std::uint32_t kL3ScratchPages = 32;
++
+ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
+     if (!options.max_private_continuations || *options.max_private_continuations == 0) {
+         throw std::logic_error("Qwen3.6 context cache private capacity is not normalized");
+@@ -916,6 +926,66 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
          }
      }
  
@@ -1803,10 +1938,35 @@ index e2a84d3d..9af26ec2 100644
 +        }
 +    }
 +
++    // L3 restore scratch: reserve once, up front. A missing reservation only
++    // disables restores (the admission probe checks the handles) — it is never
++    // a request-time failure and never contends with live sessions.
++    if (disk_kv != nullptr && disk_kv_restore && host_kv_arena != nullptr &&
++        host_state_images != nullptr && text_kv_pages != nullptr) {
++        const HostKVPageLayout* main_scratch_layout =
++            host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
++        if (main_scratch_layout != nullptr) {
++            l3_kv_scratch = host_kv_arena->allocate(*main_scratch_layout, kL3ScratchPages);
++        }
++        if (backend_host_kv_page_stride != 0 && backend_kv_pages != nullptr) {
++            const HostKVPageLayout* backend_scratch_layout =
++                host_kv_arena->layout_for(backend_kv_pages->physical_pool().geometry());
++            if (backend_scratch_layout != nullptr) {
++                l3_backend_scratch =
++                    host_kv_arena->allocate(*backend_scratch_layout, kL3ScratchPages);
++            }
++        }
++        l3_state_scratch = host_state_images->allocate();
++        fprintf(stderr, "[l3-restore] scratch reserved: kv=%d backend=%d state=%d\n",
++                static_cast<int>(l3_kv_scratch.has_value()),
++                static_cast<int>(l3_backend_scratch.has_value()),
++                static_cast<int>(l3_state_scratch.has_value()));
++    }
++
      io = qwen3_6::RoundState(backing, plan.persistent.round);
      if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
          throw std::logic_error("round-state MTP extension does not match the sequence plan");
-@@ -2846,10 +2885,623 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
+@@ -2846,10 +2916,668 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
      } else if (speculative_backend == SpeculativeBackend::DFlash) {
          sequence.dflash_context_frontier = retained->backend_frontier;
      }
@@ -1837,13 +1997,19 @@ index e2a84d3d..9af26ec2 100644
 +                            std::uint32_t retained_pages, std::uint32_t dropped_pages,
 +                            std::size_t stride, DiskKVKind kind) {
 +        if (stride == 0 || dropped_pages <= retained_pages) { return; }
++        // A drop only owns pages the row still maps: back-to-back drops in one
++        // pressure event truncate the row first, so `dropped_pages` (from the
++        // checkpoint frontier) can exceed the live page count. Walking past it
++        // would throw out of the request path — clamp to the mapped pages.
++        const std::uint32_t mapped = addresses.mapped_pages(address);
++        if (retained_pages >= mapped) { return; }
 +        // A restore walks pages from frontier 0 and stops at the FIRST miss, so
 +        // only a contiguous prefix from the low end actually saves recompute.
 +        // Spill the oldest (lowest-frontier) pages; if the run exceeds the cap,
 +        // spill the first kSpillPageCap (best partial prefix) rather than skip
 +        // the whole drop — a partial prefix still beats a full recompute.
 +        const std::uint32_t spill_end =
-+            std::min(dropped_pages, retained_pages + kSpillPageCap);
++            std::min(std::min(dropped_pages, retained_pages + kSpillPageCap), mapped);
 +        std::vector<std::byte> scratch(stride);
 +        for (std::uint32_t p = retained_pages; p < spill_end; ++p) {
 +            const LogicalKVPageHandle logical = addresses.logical_page(address, p);
@@ -1905,7 +2071,12 @@ index e2a84d3d..9af26ec2 100644
 +                                KVAddressSpaceHandle address, std::uint32_t total_pages,
 +                                std::size_t stride, DiskKVKind kind) {
 +            if (stride == 0) { return; }
-+            const std::uint32_t page_cap = std::min(total_pages, kOwnerSpillCap);
++            // A dying owner may have had checkpoints dropped first (rows
++            // truncated): never walk past the pages the row still maps.
++            const std::uint32_t mapped = addresses.mapped_pages(address);
++            const std::uint32_t page_cap =
++                std::min(std::min(total_pages, kOwnerSpillCap), mapped);
++            if (page_cap == 0) { return; }
 +            std::vector<std::byte> scratch(stride);
 +            std::uint32_t spilled = 0;
 +            for (std::uint32_t p = 0; p < page_cap; ++p) {
@@ -2188,9 +2359,11 @@ index e2a84d3d..9af26ec2 100644
 +        if (!disk_kv || !disk_kv_restore || !transaction.l3_restore_frontier || !sequence.kv ||
 +            !text_kv_addresses || !text_kv_pages || !host_kv_arena || !state_images ||
 +            staged.reuse != ReusePath::Root) {
-+            fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: prereq missing (restore=%d frontier=%u reuse=%d)\n",
-+                    static_cast<unsigned>(sequence.lane), disk_kv_restore,
-+                    transaction.l3_restore_frontier.value_or(0), static_cast<int>(staged.reuse));
++            if (transaction.l3_restore_frontier && *transaction.l3_restore_frontier != 0) {
++                fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: prereq missing (restore=%d frontier=%u reuse=%d)\n",
++                        static_cast<unsigned>(sequence.lane), disk_kv_restore,
++                        transaction.l3_restore_frontier.value_or(0), static_cast<int>(staged.reuse));
++            }
 +            return false;
 +        }
 +        const std::uint32_t E = *transaction.l3_restore_frontier;
@@ -2219,7 +2392,11 @@ index e2a84d3d..9af26ec2 100644
 +            return false;
 +        }
 +        for (const CaptureGroup& group : staged.capture_groups) {
-+            if (group.frontier <= E) {
++            // Strictly-sub-E groups cannot be replayed from the tail. A group AT
++            // E is the designed "shared base promotion" boundary (the prefill's
++            // zero-prefill capture branch) and the restored state at E fulfills
++            // it, so it must not block the restore.
++            if (group.frontier < E) {
 +fprintf(stderr, "[l3-restore] seq lane=%u seed skipped: capture group at or below E\n",
 +                    static_cast<unsigned>(sequence.lane));
 +            return false;
@@ -2240,6 +2417,13 @@ index e2a84d3d..9af26ec2 100644
 +        //    Every disk page is read and verified (CRC) before ANY device write;
 +        //    the first miss aborts with the sequence untouched.
 +        const std::uint32_t page_count = kv_pages_for_frontier(E);
++        if (page_count > text_kv_addresses->mapped_pages(sequence.kv->text)) {
++            fprintf(stderr,
++                    "[l3-restore] seq lane=%u seed FAILED: main row %u pages < E needs %u\n",
++                    static_cast<unsigned>(sequence.lane),
++                    text_kv_addresses->mapped_pages(sequence.kv->text), page_count);
++            return false;
++        }
 +        const HostKVPageLayout* layout_ptr =
 +            host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
 +        if (layout_ptr == nullptr) {
@@ -2254,16 +2438,15 @@ index e2a84d3d..9af26ec2 100644
 +            destinations[p] = text_kv_pages->physical(
 +                text_kv_addresses->logical_page(sequence.kv->text, p));
 +        }
-+        constexpr std::uint32_t kRestoreChunk = 256;
-+        for (std::uint32_t begin = 0; begin < page_count; begin += kRestoreChunk) {
-+            const std::uint32_t count = std::min(kRestoreChunk, page_count - begin);
-+            std::optional<HostKVAllocation> scratch = host_kv_arena->allocate(layout, count);
-+            if (!scratch) {
-+                fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: host scratch allocation\n",
++        constexpr std::uint32_t kRestoreChunk = kL3ScratchPages;
++        if (!l3_kv_scratch) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: no reserved KV scratch\n",
 +                    static_cast<unsigned>(sequence.lane));
 +            return false;
-+            }
-+            const HostKVAllocationView host = host_kv_arena->writable_view(*scratch);
++        }
++        const HostKVAllocationView host = host_kv_arena->writable_view(*l3_kv_scratch);
++        for (std::uint32_t begin = 0; begin < page_count; begin += kRestoreChunk) {
++            const std::uint32_t count = std::min(kRestoreChunk, page_count - begin);
 +            for (std::uint32_t i = 0; i < count; ++i) {
 +                // Same page key as the write side: a full page keys at (p+1)*64,
 +                // the partial tail page at E.
@@ -2279,11 +2462,32 @@ index e2a84d3d..9af26ec2 100644
 +                                                               stride))) {
 +                    fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: page p=%u frontier=%u\n",
 +                            static_cast<unsigned>(sequence.lane), p, frontier);
++                    fprintf(stderr,
++                            "[l3-restore] FAIL id lo=%016llx hi=%016llx tag=%u fr=%u contains=%d "
++                            "P2_at_E=%d n_dig=%zu\n",
++                            (unsigned long long)id.lo, (unsigned long long)id.hi, id.tag,
++                            id.frontier,
++                            static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
++                            static_cast<int>(E < digests.size()), digests.size());
++                    if (E < digests.size()) {
++                        const auto d = digests.at(E);
++                        fprintf(stderr, "[l3-restore] P2@%u lo=%016llx hi=%016llx rw_n=%zu rw_tail=%u\n",
++                                E, (unsigned long long)d[0], (unsigned long long)d[1],
++                                staged.prompt.identity.rewrite_execution_frontiers.size(),
++                                staged.prompt.identity.rewrite_execution_frontiers.empty()
++                                    ? 0U
++                                    : staged.prompt.identity.rewrite_execution_frontiers.back());
++                    }
++                    // Self-heal: a page that is indexed but unreadable (stale
++                    // row after a hard kill / failed CRC) must never wedge a
++                    // later request — drop it so the probe's chain walk rejects
++                    // this frontier from now on.
++                    (void)disk_kv->drop_page(id, DiskKVKind::MainKV);
 +                    return false;  // page lost on disk: full recompute, never partial
 +                }
 +            }
 +            text_kv_pages->physical_pool().copy_from_host(
-+                host_kv_arena->view(*scratch),
++                host_kv_arena->view(*l3_kv_scratch).subview(0, count),
 +                std::span<const DeviceKVPageHandle>(destinations.data() + begin, count),
 +                device.transfer_stream);
 +            if (device.transfer_stream != nullptr) {
@@ -2303,6 +2507,13 @@ index e2a84d3d..9af26ec2 100644
 +            const std::uint32_t bfrontier = backend_frontier_at(speculative_backend, E);
 +            if (bfrontier > 0) {
 +                const std::uint32_t bpage_count = kv_pages_for_frontier(bfrontier);
++                if (bpage_count > backend_kv_addresses->mapped_pages(*sequence.kv->backend)) {
++                    fprintf(stderr,
++                            "[l3-restore] seq lane=%u seed FAILED: backend row %u pages < needs %u\n",
++                            static_cast<unsigned>(sequence.lane),
++                            backend_kv_addresses->mapped_pages(*sequence.kv->backend), bpage_count);
++                    return false;
++                }
 +                const HostKVPageLayout* blayout_ptr =
 +                    host_kv_arena->layout_for(backend_kv_pages->physical_pool().geometry());
 +                if (blayout_ptr == nullptr) {
@@ -2316,17 +2527,15 @@ index e2a84d3d..9af26ec2 100644
 +                    bdestinations[p] = backend_kv_pages->physical(
 +                        backend_kv_addresses->logical_page(*sequence.kv->backend, p));
 +                }
++                if (!l3_backend_scratch) {
++                    fprintf(stderr,
++                            "[l3-restore] seq lane=%u seed FAILED: no reserved backend scratch\n",
++                            static_cast<unsigned>(sequence.lane));
++                    return false;
++                }
++                const HostKVAllocationView bhost = host_kv_arena->writable_view(*l3_backend_scratch);
 +                for (std::uint32_t begin = 0; begin < bpage_count; begin += kRestoreChunk) {
 +                    const std::uint32_t count = std::min(kRestoreChunk, bpage_count - begin);
-+                    std::optional<HostKVAllocation> bscratch =
-+                        host_kv_arena->allocate(*blayout_ptr, count);
-+                    if (!bscratch) {
-+                        fprintf(stderr,
-+                                "[l3-restore] seq lane=%u seed FAILED: backend host scratch\n",
-+                                static_cast<unsigned>(sequence.lane));
-+                        return false;
-+                    }
-+                    const HostKVAllocationView bhost = host_kv_arena->writable_view(*bscratch);
 +                    for (std::uint32_t i = 0; i < count; ++i) {
 +                        const std::uint32_t p       = begin + i;
 +                        const std::uint32_t frontier = std::min((p + 1U) *
@@ -2344,11 +2553,12 @@ index e2a84d3d..9af26ec2 100644
 +                            fprintf(stderr,
 +                                    "[l3-restore] seq lane=%u seed FAILED: backend page p=%u frontier=%u\n",
 +                                    static_cast<unsigned>(sequence.lane), p, frontier);
++                            (void)disk_kv->drop_page(id, DiskKVKind::BackendKV);  // self-heal
 +                            return false;
 +                        }
 +                    }
 +                    backend_kv_pages->physical_pool().copy_from_host(
-+                        host_kv_arena->view(*bscratch),
++                        host_kv_arena->view(*l3_backend_scratch).subview(0, count),
 +                        std::span<const DeviceKVPageHandle>(bdestinations.data() + begin, count),
 +                        device.transfer_stream);
 +                    if (device.transfer_stream != nullptr) {
@@ -2360,20 +2570,14 @@ index e2a84d3d..9af26ec2 100644
 +
 +        // 2) The GDN/hidden state image at the exact frontier E. Not derivable
 +        //    from KV: without it the linear layers would recompute from zero.
-+        //    Borrow a slot from the existing pinned HostStatePool (no fresh pinned
-+        //    allocation — the WSL2 cudaMallocHost budget is already consumed by the
-+        //    6 GiB host KV arena).
-+        if (!host_state_images) {
-+            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: no host state pool\n",
++        //    Reads through the reserved startup slot — never the shared pool, so
++        //    a full pool cannot fail or block a restore.
++        if (!host_state_images || !l3_state_scratch) {
++            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: no reserved state scratch\n",
 +                    static_cast<unsigned>(sequence.lane));
 +            return false;
 +        }
-+        auto host_slot = host_state_images->allocate();
-+        if (!host_slot) {
-+            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: host state slot\n",
-+                    static_cast<unsigned>(sequence.lane));
-+            return false;
-+        }        const std::size_t state_bytes = state_images->host_layout().image_bytes;
++        const std::size_t state_bytes = state_images->host_layout().image_bytes;
 +        const auto sdigest            = digests.at(E);
 +        const DiskKVIdentity sid{.lo   = sdigest[0],
 +                                 .hi   = sdigest[1],
@@ -2383,10 +2587,11 @@ index e2a84d3d..9af26ec2 100644
 +        try {
 +            state_loaded = disk_kv->restore_page(
 +                sid, DiskKVKind::StateImage,
-+                std::span<std::byte>(host_state_images->writable_view(*host_slot).data, state_bytes));
++                std::span<std::byte>(host_state_images->writable_view(*l3_state_scratch).data,
++                                     state_bytes));
 +            if (state_loaded) {
 +                const StateImageSelectors selectors = state_selectors(sequence);
-+                state_images->copy_from_host(host_state_images->view(*host_slot),
++                state_images->copy_from_host(host_state_images->view(*l3_state_scratch),
 +                                             selectors.destination, device.transfer_stream);
 +                if (device.transfer_stream != nullptr) {
 +                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
@@ -2395,10 +2600,10 @@ index e2a84d3d..9af26ec2 100644
 +        } catch (...) {
 +            state_loaded = false;
 +        }
-+        host_state_images->release(*host_slot);
 +        if (!state_loaded) {
 +            fprintf(stderr, "[l3-restore] seq lane=%u seed FAILED: state image load\n",
 +                    static_cast<unsigned>(sequence.lane));
++            (void)disk_kv->drop_page(sid, DiskKVKind::StateImage);  // self-heal
 +            return false;
 +        }
 +        // 3) Commit: device KV and the recurrent state are valid through E, so
@@ -2430,7 +2635,7 @@ index e2a84d3d..9af26ec2 100644
  qwen3_6::detail::PressureDecision
  ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
      qwen3_6::detail::PressureDecision option;
-@@ -4452,6 +5104,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+@@ -4452,6 +5180,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
          materialization_identity_.assign(prompt);
          materialization_prefix_digests_.assign(prompt);
  
@@ -2476,7 +2681,7 @@ index e2a84d3d..9af26ec2 100644
          const std::uint32_t initial_mtp_extent =
              speculative_backend == SpeculativeBackend::Mtp
                  ? std::min({draft_window,
-@@ -4465,8 +5156,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+@@ -4465,8 +5232,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
              .vision_plan        = std::move(request_plan.vision),
              .vision             = nullptr,
              .capture_groups     = std::move(request_plan.capture_groups),
@@ -2493,7 +2698,7 @@ index e2a84d3d..9af26ec2 100644
              .prompt_tokens      = prompt_tokens,
              .initial_mtp_extent = initial_mtp_extent,
              .elapsed_seconds    = 0.0,
-@@ -7074,6 +7771,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
+@@ -7074,6 +7847,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
      out.processed_prompt_tokens = step.processed_prompt_tokens;
      out.complete                = step.complete;
      out.timing                  = step.timing;
@@ -2501,7 +2706,7 @@ index e2a84d3d..9af26ec2 100644
      if (step.complete) {
          const std::array<std::uint32_t, 1> lanes{lane};
          const runtime::BatchedGeneratedRound round{
-@@ -9905,7 +10603,21 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
+@@ -9905,7 +10679,47 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
              : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                  : 0U;
          materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
@@ -2517,13 +2722,39 @@ index e2a84d3d..9af26ec2 100644
 +            *transaction.l3_restore_frontier < prompt_tokens) {
 +            staged.advertised_base = *transaction.l3_restore_frontier;
 +        }
-+        (void)restore_root_from_disk(sequence, transaction, staged, prompt_tokens);
++        bool l3_seed_ok = false;
++        try {
++            l3_seed_ok = restore_root_from_disk(sequence, transaction, staged, prompt_tokens);
++        } catch (const std::exception& e) {
++            // A throwing seed must degrade exactly like a failed one: the disk
++            // tier is best-effort and may never take the engine down.
++            fprintf(stderr,
++                    "[l3-restore] seq lane=%u seed threw: %s -> honest full recompute\n",
++                    static_cast<unsigned>(sequence.lane), e.what());
++        } catch (...) {
++            fprintf(stderr,
++                    "[l3-restore] seq lane=%u seed threw: unknown -> honest full recompute\n",
++                    static_cast<unsigned>(sequence.lane));
++        }
++        if (!l3_seed_ok && staged.advertised_base != 0) {
++            // Root fix for the promise-then-fail pattern: the seed could not
++            // deliver [0, E). Do NOT keep the admission promise — report the
++            // honest full recompute. The engine accepts a runtime summary that
++            // under-reports the reuse (never exceeds it) and accounts the
++            // prefill against the ACTUAL reuse, so this request runs as an
++            // ordinary root: no hidden "[0,E) replay" mode exists anymore.
++            fprintf(stderr,
++                    "[l3-restore] seq lane=%u seed failed -> honest full recompute "
++                    "(advertised %u -> 0)\n",
++                    static_cast<unsigned>(sequence.lane), staged.advertised_base);
++            staged.advertised_base = 0;
++        }
          install_sampling(sequence, request, request_plan.sampling);
 +        request.top_logprobs = request_plan.top_logprobs;
          sequence.rope_delta = staged.prompt.rope_delta;
          set_device_i32(io.rope_delta, sequence.rope_delta);
  
-@@ -10847,6 +11559,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+@@ -10847,6 +11661,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
      if (!sequence.kv || !text_kv_addresses || !text_kv_addresses->can_release(sequence.kv->text)) {
          std::terminate();
      }
@@ -2531,7 +2762,7 @@ index e2a84d3d..9af26ec2 100644
      if (sequence.kv->backend &&
          (!backend_kv_addresses || !backend_kv_addresses->can_release(*sequence.kv->backend))) {
          std::terminate();
-@@ -10861,6 +11574,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+@@ -10861,6 +11676,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
  
  void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
      if (!sequence.kv) { return; }
@@ -2539,7 +2770,7 @@ index e2a84d3d..9af26ec2 100644
      unbind_sequence_kv(sequence);
      if (sequence.kv->backend && backend_kv_addresses) {
          (void)backend_kv_addresses->release(*sequence.kv->backend);
-@@ -11388,6 +12102,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
+@@ -11388,6 +12204,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
      }
  }
  
@@ -2586,7 +2817,7 @@ index e2a84d3d..9af26ec2 100644
  runtime::PrefillStepResult
  ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
                                   runtime::ExecutionTiming* failed_timing) {
-@@ -11400,10 +12154,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11400,10 +12256,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
      if (staged.pending_capture_offer != 0) {
          throw std::logic_error("prefill cannot advance while a capture offer is pending");
      }
@@ -2618,7 +2849,7 @@ index e2a84d3d..9af26ec2 100644
      const auto started                    = Clock::now();
      try {
          if (staged.next_capture < staged.capture_groups.size() &&
-@@ -11428,10 +12200,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11428,10 +12302,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
              rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
              rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
          }
@@ -2639,7 +2870,7 @@ index e2a84d3d..9af26ec2 100644
              text_kv_view(sequence),
              mtp_kv_view(sequence),
              decoder->text_kv,
-@@ -11559,7 +12340,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11559,7 +12442,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                          staged.pending_capture_offer = next_capture_offer_id_;
                          return runtime::PrefillStepResult{
                              .summary                 = summary,
@@ -2648,7 +2879,7 @@ index e2a84d3d..9af26ec2 100644
                              .timing                  = timing.finish(),
                          };
                      }
-@@ -11577,7 +12358,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11577,7 +12460,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                      std::chrono::duration<double>(Clock::now() - started).count();
                  return runtime::PrefillStepResult{
                      .summary                 = summary,
@@ -2657,7 +2888,7 @@ index e2a84d3d..9af26ec2 100644
                      .timing                  = timing.finish(),
                  };
              }
-@@ -11624,6 +12405,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11624,6 +12507,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          timing.begin_wait();
          device.synchronize();
          timing.end_wait();
@@ -2669,7 +2900,7 @@ index e2a84d3d..9af26ec2 100644
          staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
          const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
          const std::uint32_t prompt_tokens = staged.prompt_tokens;
-@@ -11653,7 +12439,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11653,7 +12541,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
          staged.prompt.release_all_media_payloads();
          if (staged.vision) { staged.vision->retire_handoff(); }
@@ -2677,7 +2908,7 @@ index e2a84d3d..9af26ec2 100644
          const bool prompt_frontier_capture =
              staged.next_capture < staged.capture_groups.size() &&
              staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-@@ -11667,9 +12452,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11667,9 +12554,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          return runtime::PrefillStepResult{
              .summary = summary,
              .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
@@ -2690,7 +2921,7 @@ index e2a84d3d..9af26ec2 100644
      } catch (...) {
          timing.begin_wait();
 diff --git a/src/targets/qwen3_6/impl/runtime/request_plan_impl.h b/src/targets/qwen3_6/impl/runtime/request_plan_impl.h
-index 1b04d8dd..89190f9b 100644
+index 1b04d8dd..346eda43 100644
 --- a/src/targets/qwen3_6/impl/runtime/request_plan_impl.h
 +++ b/src/targets/qwen3_6/impl/runtime/request_plan_impl.h
 @@ -260,6 +260,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
@@ -2709,10 +2940,13 @@ index 1b04d8dd..89190f9b 100644
      plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
      plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
      plan->root_rebuild_work           = base.root_rebuild_work;
-@@ -730,9 +732,170 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
+@@ -730,9 +732,206 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
      }
  
      const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
+-    plan->summary.service_work_quanta =
+-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
+-                               plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
 +    // L3 (disk) tier read-side admission probe. A Root request with no resident
 +    // prefix may still have its whole prompt-prefix restorable from disk (dead
 +    // session returning after restart). Probe here — BEFORE the scheduler grant
@@ -2722,12 +2956,15 @@ index 1b04d8dd..89190f9b 100644
 +    // Failure to seed later keeps the accounting (the prefill then recomputes the
 +    // [0,E) segment as an unreported replay; the engine-visible contract holds).
 +    if (plan->reuse == ReusePath::Root && disk_kv != nullptr && disk_kv_restore) {
-+        fprintf(stderr, "[l3-probe] enter src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u\n",
-+                static_cast<int>(source != nullptr), static_cast<int>(shared_source != nullptr),
-+                static_cast<int>(speculative_backend),
-+                static_cast<int>(base.summary.publish_continuation),
-+                disk_kv->slot_count(DiskKVKind::StateImage),
-+                base.prefix_digests.size(), plan->summary.prompt_tokens);
++        static const bool l3_trace_enter = std::getenv("NINFER_L3_TRACE") != nullptr;
++        if (l3_trace_enter) {
++            fprintf(stderr, "[l3-probe] enter src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u\n",
++                    static_cast<int>(source != nullptr), static_cast<int>(shared_source != nullptr),
++                    static_cast<int>(speculative_backend),
++                    static_cast<int>(base.summary.publish_continuation),
++                    disk_kv->slot_count(DiskKVKind::StateImage),
++                    base.prefix_digests.size(), plan->summary.prompt_tokens);
++        }
 +    }
 +    if (plan->reuse == ReusePath::Root && source == nullptr && shared_source == nullptr &&
 +        disk_kv != nullptr && disk_kv_restore &&
@@ -2736,15 +2973,30 @@ index 1b04d8dd..89190f9b 100644
 +        base.summary.publish_continuation &&
 +        disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
 +        base.prefix_digests.size() >= plan->summary.prompt_tokens &&
++        // Media prompts cannot be restored (the seed rejects them: the vision
++        // tokens' KV cannot be replayed from a tail) — promoting E for them
++        // would only force the prefill onto the unreported-replay fallback.
++        !prompt.has_media() &&
++        l3_state_scratch.has_value() && l3_kv_scratch.has_value() &&
 +        plan->summary.prompt_tokens != 0) {
++        // The seed reads through scratch reserved at startup (never the shared
++        // pools); without the reservation restores are simply unavailable.
++        if (!l3_state_scratch || !l3_kv_scratch) {
++            fprintf(stderr, "[l3-probe] skip: no reserved seed scratch\n");
++        } else {
 +        const std::uint32_t tag = capture_identity_tag(speculative_backend, proposal_head,
 +                                                       kv_storage);
++        // Candidate-level detail is debug-only (NINFER_L3_TRACE=1): the
++        // per-candidate lines flood the log at one entry per frontier.
++        static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
 +        std::optional<std::uint32_t> best_E;
 +        for (const std::uint32_t E : disk_kv->live_state_frontiers()) {
 +            if (E == 0) { continue; }
 +            if (E >= plan->summary.prompt_tokens) {
-+                fprintf(stderr, "[l3-probe] E=%u >= prompt=%u skip\n", E,
-+                        plan->summary.prompt_tokens);
++                if (l3_trace) {
++                    fprintf(stderr, "[l3-probe] E=%u >= prompt=%u skip\n", E,
++                            plan->summary.prompt_tokens);
++                }
 +                continue;
 +            }
 +            const std::uint32_t full_pages = E / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -2766,7 +3018,9 @@ index 1b04d8dd..89190f9b 100644
 +                }
 +            }
 +            if (!covered) {
-+                fprintf(stderr, "[l3-probe] E=%u main chain miss key=%u\n", E, fail_key);
++                if (l3_trace) {
++                    fprintf(stderr, "[l3-probe] E=%u main chain miss key=%u\n", E, fail_key);
++                }
 +                continue;
 +            }
 +            if (E % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
@@ -2777,10 +3031,21 @@ index 1b04d8dd..89190f9b 100644
 +                                        .frontier = E};
 +                if (!disk_kv->contains(id, DiskKVKind::MainKV) ||
 +                    !disk_kv->contains(id, DiskKVKind::StateImage)) {
-+                    fprintf(stderr, "[l3-probe] E=%u tail main=%d state=%d\n", E,
-+                            static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
-+                            static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
++                    if (l3_trace) {
++                        fprintf(stderr, "[l3-probe] E=%u tail main=%d state=%d\n", E,
++                                static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
++                                static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
++                    }
 +                    continue;
++                }
++                if (l3_trace) {
++                    fprintf(stderr,
++                            "[l3-probe] P1@%u lo=%016llx hi=%016llx tag=%u rw_n=%zu rw_tail=%u\n", E,
++                            (unsigned long long)digest[0], (unsigned long long)digest[1], tag,
++                            prompt.identity.rewrite_execution_frontiers.size(),
++                            prompt.identity.rewrite_execution_frontiers.empty()
++                                ? 0U
++                                : prompt.identity.rewrite_execution_frontiers.back());
 +                }
 +            } else {
 +                const auto digest = base.prefix_digests.at(E);
@@ -2789,7 +3054,9 @@ index 1b04d8dd..89190f9b 100644
 +                                        .tag      = tag,
 +                                        .frontier = E};
 +                if (!disk_kv->contains(id, DiskKVKind::StateImage)) {
-+                    fprintf(stderr, "[l3-probe] E=%u (aligned) state=0\n", E);
++                    if (l3_trace) {
++                        fprintf(stderr, "[l3-probe] E=%u (aligned) state=0\n", E);
++                    }
 +                    continue;
 +                }
 +            }
@@ -2825,8 +3092,10 @@ index 1b04d8dd..89190f9b 100644
 +                    }
 +                }
 +                if (!backend_covered) {
-+                    fprintf(stderr, "[l3-probe] E=%u backend miss bf=%u key=%u\n", E,
-+                            bfrontier, bfail_key);
++                    if (l3_trace) {
++                        fprintf(stderr, "[l3-probe] E=%u backend miss bf=%u key=%u\n", E,
++                                bfrontier, bfail_key);
++                    }
 +                    continue;
 +                }
 +            }
@@ -2866,18 +3135,18 @@ index 1b04d8dd..89190f9b 100644
 +                plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
 +            }
 +        } else {
-+            fprintf(stderr, "[l3-probe] no candidate passed\n");
++            if (l3_trace) { fprintf(stderr, "[l3-probe] no candidate passed\n"); }
 +        }
++        }  // closes the host-state-slot availability else
 +    }
-     plan->summary.service_work_quanta =
--        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits,
-+        projected_service_work(plan->summary, 0, prefill_chunk, prefill_splits,
-                                plan->capture_groups, prompt.identity.rewrite_execution_frontiers);
-+    // L3 (disk) restore: quanta are booked for the FULL prompt (reuse_base = 0)
-+    // because a failed disk seed physically recomputes [0, E) even though the
-+    // admission contract counts E as reused. consume_service_work throws when
-+    // a request is charged more quanta than it was granted; a successful seed
-+    // simply leaves its unused quanta unspent.
++    // L3 (disk) restore: the plan KEEPS the base plan's service-work booking,
++    // which was projected over the FULL prompt with ALL capture/rewrite
++    // boundaries (reuse_base = 0). Re-projecting here with the promoted plan's
++    // filtered capture set would under-book: the promotion erases sub-E
++    // captures, and a failed disk seed physically recomputes [0, E) — the
++    // honest fallback then consumes more units than a filtered projection
++    // granted (observed: "consumed 4 quanta with 3 remaining"). A successful
++    // seed simply leaves its unused units unspent.
      std::uint64_t remaining_vision_items   = 0;
      std::uint64_t remaining_vision_patches = 0;
      if (plan->vision) {

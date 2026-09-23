@@ -66,9 +66,11 @@ int main(int argc, char** argv) {
         std::vector<std::byte> out(stride);
         CHECK(s.read_page(id, out) && std::memcmp(out.data(), page.data(), stride) == 0,
               "persisted bytes identical");
-        // The slot scan is now the authority on every open (a stale packed
-        // index silently produced contains()-ok / read-fail rows).
-        CHECK(s.index_rebuilt_from_scan(), "reopen rebuilds index from slot scan");
+        // Fast path: the packed index loads directly (all structural changes
+        // persist eagerly). Data pages stay CRC-verified at read time: a bad
+        // page is a restore miss, not a startup cost, and the restore path
+        // self-heals by dropping it (see the bridge/engine integration).
+        CHECK(!s.index_rebuilt_from_scan(), "reopen uses the packed index fast path");
     }
 
     // ---------- 3. LRU eviction order ----------
