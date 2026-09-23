@@ -100,10 +100,10 @@ index 98052fdb..70389777 100644
    core/layout.cpp
 diff --git a/src/core/disk_kv_bridge.cpp b/src/core/disk_kv_bridge.cpp
 new file mode 100644
-index 00000000..00726f62
+index 00000000..0839c099
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.cpp
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,393 @@
 +#include "core/disk_kv_bridge.h"
 +
 +#include <algorithm>
@@ -154,6 +154,7 @@ index 00000000..00726f62
 +        sopts.capacity_bytes = budget;
 +        sopts.max_slots      = 0;  // derived from capacity_bytes
 +        sopts.verify_crc     = opts_.verify_crc;
++        sopts.defer_index_updates = true;
 +        f.store = std::make_unique<DiskKVStore>(sopts);
 +    };
 +    const std::size_t total = opts_.capacity_bytes;
@@ -207,17 +208,12 @@ index 00000000..00726f62
 +        std::unique_lock<std::mutex> lock(qmu_);
 +        qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
 +    }
-+    // Durability barrier: land any batched index updates.
-+    if (flush_pending_ != 0) {
-+        flush_pending_ = 0;
-+        for (Family& fam : families_) {
-+            if (fam.store != nullptr) { fam.store->flush_index(); }
-+        }
-+    }
++    // Worker keeps in_flight nonzero through its idle flush.
 +}
 +
 +void DiskKVBridge::worker_loop() {
 +    while (true) {
++        try {
 +        SpillJob job;
 +        bool have = false;
 +        {
@@ -236,16 +232,40 @@ index 00000000..00726f62
 +            continue;
 +        }
 +        spill_queued(job);
-+        std::lock_guard<std::mutex> lock(qmu_);
-+        in_flight_ -= 1;
-+        if (queue_.empty() && flush_pending_ != 0) {
++        bool flush = false;
++        {
++            std::unique_lock<std::mutex> lock(qmu_);
++            // Consecutive resumable tickets have scheduler gaps. Coalesce them;
++            // waiting releases qmu and never delays try_submit on the engine.
++            if (queue_.empty() && flush_pending_ != 0 && !quit_) {
++                qcv_.wait_for(lock, std::chrono::milliseconds(10),
++                              [this] { return quit_ || !queue_.empty(); });
++            }
++            flush = queue_.empty() && flush_pending_ != 0;
++        }
++        if (flush) {
 +            // The burst drained: land the batched index updates while idle.
 +            flush_pending_ = 0;
 +            for (Family& fam : families_) {
 +                if (fam.store != nullptr) { fam.store->flush_index(); }
 +            }
 +        }
-+        qcv_.notify_all();  // wait_idle may be waiting on the queue draining
++        {
++            std::lock_guard<std::mutex> lock(qmu_);
++            in_flight_ -= 1;
++        }
++        qcv_.notify_all();  // wait_idle includes flush; enqueue never holds a disk lock
++        } catch (const std::exception& e) {
++            // A worker-side I/O/allocation failure must never terminate the
++            // engine. Drop to the idle wait; the next job retries fresh.
++            std::lock_guard<std::mutex> lock(qmu_);
++            in_flight_ -= (in_flight_ > 0 ? 1 : 0);
++            qcv_.notify_all();
++        } catch (...) {
++            std::lock_guard<std::mutex> lock(qmu_);
++            in_flight_ -= (in_flight_ > 0 ? 1 : 0);
++            qcv_.notify_all();
++        }
 +    }
 +}
 +
@@ -267,7 +287,7 @@ index 00000000..00726f62
 +        stats_.queue_drops += 1;
 +        return false;  // backpressure: page won't be restorable (recompute later)
 +    }
-+    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}});
++    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}, {}, {}, false});
 +    qcv_.notify_all();
 +    return true;
 +}
@@ -295,17 +315,27 @@ index 00000000..00726f62
 +        return false;
 +    }
 +    if (quit_) { return false; }
-+    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}});
++    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}, {}, {}, false});
 +    qcv_.notify_all();
 +    return true;
 +}
 +
 +void DiskKVBridge::spill_queued(SpillJob& job) {
 +    Family& f = family(job.kind);
-+    if (f.store == nullptr || job.bytes.size() != f.stride) { return; }
++    const auto finish = [&](SpillStatus status) {
++        if (job.completion) { job.completion->status.store(status, std::memory_order_release); }
++    };
++    try {
++    if (job.probe) {
++        const bool present = f.store && f.store->contains(job.id);
++        if (present) { std::lock_guard<std::mutex> lock(mu_); ++stats_.spill_dups; }
++        finish(present ? SpillStatus::Present : SpillStatus::Missing);
++        return;
++    }
++    const auto bytes = job.borrowed.empty() ? std::span<const std::byte>(job.bytes) : job.borrowed;
++    if (f.store == nullptr || bytes.size() != f.stride) { finish(SpillStatus::Failed); return; }
 +    std::vector<std::uint32_t> evicted;
-+    std::span<const std::byte> bytes(job.bytes);
-+    if (!f.store->upsert_page(job.id, bytes, &evicted)) { return; }
++    if (!f.store->upsert_page(job.id, bytes, &evicted)) { finish(SpillStatus::Failed); return; }
 +    // Batched index durability (see flush_pending_ in the header): a per-page
 +    // atomic index rewrite dominated large owner-death sweeps.
 +    if (++flush_pending_ >= 64) {
@@ -316,8 +346,31 @@ index 00000000..00726f62
 +    }
 +    std::lock_guard<std::mutex> lock(mu_);
 +    stats_.spills += 1;
-+    stats_.spill_bytes += job.bytes.size();
++    stats_.spill_bytes += bytes.size();
 +    stats_.evicted_slots += evicted.size();
++    finish(SpillStatus::Written);
++    } catch (...) { finish(SpillStatus::Failed); }
++}
++
++SpillTicket DiskKVBridge::try_probe(const DiskKVIdentity& id, DiskKVKind kind) {
++    std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
++    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
++    auto ticket = std::make_shared<SpillCompletion>();
++    SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.probe = true;
++    queue_.push_back(std::move(job));
++    qcv_.notify_one();
++    return ticket;
++}
++
++SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
++                                    std::span<const std::byte> bytes) {
++    std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
++    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
++    auto ticket = std::make_shared<SpillCompletion>();
++    SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.borrowed = bytes;
++    queue_.push_back(std::move(job));
++    qcv_.notify_one();
++    return ticket;
 +}
 +
 +bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
@@ -446,10 +499,10 @@ index 00000000..00726f62
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_bridge.h b/src/core/disk_kv_bridge.h
 new file mode 100644
-index 00000000..349f2dcd
+index 00000000..06d627d6
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.h
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,218 @@
 +#pragma once
 +// Engine-facing facade over DiskKVStore (the L3 disk cold tier).
 +//
@@ -482,6 +535,7 @@ index 00000000..349f2dcd
 +#include "core/disk_kv_store.h"
 +
 +#include <array>
++#include <atomic>
 +#include <chrono>
 +#include <cstddef>
 +#include <condition_variable>
@@ -504,10 +558,19 @@ index 00000000..349f2dcd
 +
 +/** One queued spill: identity + copied bytes. Engine copies; the bridge's
 + *  worker thread does the disk write (off the engine's hot path). */
++// Completion acknowledges upsert/readability, NOT durable index publication.
++// Probe runs on the writer too, so dedupe never waits for the store lock on the engine.
++enum class SpillStatus : std::uint8_t { Pending, Present, Missing, Written, Failed };
++struct SpillCompletion { std::atomic<SpillStatus> status{SpillStatus::Pending}; };
++using SpillTicket = std::shared_ptr<SpillCompletion>;
++
 +struct SpillJob {
 +    DiskKVIdentity id;
 +    DiskKVKind kind;
 +    std::vector<std::byte> bytes;
++    SpillTicket completion;
++    std::span<const std::byte> borrowed;
++    bool probe = false;
 +};
 +
 +struct DiskKVBridgeStats {
@@ -565,6 +628,16 @@ index 00000000..349f2dcd
 +     *  true if restorable after the call (fresh write or dedupe hit). */
 +    bool spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
 +                         std::span<const std::byte> bytes);
++
++    // Null ticket = busy; retry without releasing the owner. No store lock.
++    // Borrowed bytes MUST remain immutable/alive until poll != Pending,
++    // including cancellation. Worker never accesses SequenceState.
++    SpillTicket try_probe(const DiskKVIdentity& id, DiskKVKind kind);
++    SpillTicket try_submit(const DiskKVIdentity& id, DiskKVKind kind,
++                           std::span<const std::byte> bytes);
++    static SpillStatus poll(const SpillTicket& ticket) noexcept {
++        return ticket->status.load(std::memory_order_acquire);
++    }
 +
 +    /** Wait until all queued spill jobs have been applied. Test/diagnostics. */
 +    void wait_idle();
@@ -650,10 +723,10 @@ index 00000000..349f2dcd
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_store.cpp b/src/core/disk_kv_store.cpp
 new file mode 100644
-index 00000000..3e95bdae
+index 00000000..07becfe1
 --- /dev/null
 +++ b/src/core/disk_kv_store.cpp
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,499 @@
 +#include "core/disk_kv_store.h"
 +
 +#include <fcntl.h>
@@ -807,8 +880,8 @@ index 00000000..3e95bdae
 +    for (std::uint32_t s = 0; s < max_slots_; ++s) { free_slots_.push_back(s); }
 +
 +    // Fast path: load the packed index (a full slot scan here costs minutes on
-+    // virtiofs-mounted stores; all structural changes persist the index
-+    // eagerly, so the rows are consistent). Data CRCs stay lazily verified at
++    // virtiofs-mounted stores; stale rows are checked against slot identities,
++    // including interrupted batches). Data CRCs stay lazily verified at
 +    // read time by design (a corrupted page becomes a restore miss). Without a
 +    // valid index file a full scan rebuilds it.
 +    if (!load_index()) {
@@ -852,6 +925,7 @@ index 00000000..3e95bdae
 +    IdxHeader hdr{};
 +    if (std::fread(&hdr, sizeof(hdr), 1, f) != 1 ||
 +        hdr.magic != IdxHeader::kMagic ||
++        hdr.version != 1 || hdr.count > max_slots_ ||
 +        hdr.slot_size != static_cast<std::uint32_t>(slot_bytes()) ||
 +        hdr.max_slots != max_slots_) {
 +        std::fclose(f);
@@ -916,11 +990,13 @@ index 00000000..3e95bdae
 +        if (!live[s]) { free_slots_.push_back(s); }
 +    }
 +    rebuilt_from_scan_ = true;
++    index_dirty_ = true;
 +    persist_index_unlocked();
 +}
 +
 +void DiskKVStore::persist_index_unlocked() {
-+    // Atomic: write a tmp file, fsync, rename over the index path.
++    if (!index_dirty_) { return; }
++    // Atomic publication only: no fsync on the hot path.
 +    const std::string path = index_path(opts_.path);
 +    const std::string tmp  = path + ".tmp";
 +    FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -932,9 +1008,7 @@ index 00000000..3e95bdae
 +    hdr.slot_size = static_cast<std::uint32_t>(slot_bytes());
 +    hdr.max_slots = max_slots_;
 +    hdr.clock     = clock_;
-+    std::fwrite(&hdr, sizeof(hdr), 1, f);
-+    std::fseek(f, 0, SEEK_END);
-+    const std::size_t total = (std::size_t)ftell(f) + index_.size() * sizeof(IdxEntry);
++    bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1;
 +    for (const auto& [id, s] : index_) {
 +        IdxEntry r{};
 +        r.lo = id.lo;
@@ -942,17 +1016,18 @@ index 00000000..3e95bdae
 +        r.tag = id.tag;
 +        r.frontier = id.frontier;
 +        r.slot = s;
-+        std::fwrite(&r, sizeof(r), 1, f);
++        if (std::fwrite(&r, sizeof(r), 1, f) != 1) { ok = false; break; }
 +    }
-+    std::fflush(f);
-+    std::fclose(f);
++    if (std::fflush(f) != 0) { ok = false; }
++    if (std::fclose(f) != 0) { ok = false; }
 +    // Deliberately NO fsync on the hot path: a torn index is recovered by a
 +    // full header rescan on next open (cheap: slots are CRC-verified), and
 +    // the spill worker would otherwise stall behind fsync latency per page.
-+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
++    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
 +        ::unlink(tmp.c_str());
 +        return;
 +    }
++    index_dirty_ = false;
 +}
 +
 +// ---------- internals ----------
@@ -1005,9 +1080,11 @@ index 00000000..3e95bdae
 +// ---------- API ----------
 +
 +std::uint32_t DiskKVStore::live_slots() const noexcept {
++    std::lock_guard<std::mutex> lock(mu_);
 +    return static_cast<std::uint32_t>(index_.size());
 +}
 +std::size_t DiskKVStore::used_bytes() const noexcept {
++    std::lock_guard<std::mutex> lock(mu_);
 +    return index_.size() * slot_pitch_;
 +}
 +std::size_t DiskKVStore::free_bytes() const noexcept {
@@ -1023,6 +1100,7 @@ index 00000000..3e95bdae
 +    if (it != index_.end()) {
 +        // Already restorable: refresh LRU in memory (flushed by flush_index).
 +        (*slot_hdr(it->second)).last_used = bump_clock();
++        index_dirty_ = true;
 +        return true;
 +    }
 +
@@ -1043,6 +1121,8 @@ index 00000000..3e95bdae
 +    }
 +
 +    // Write page bytes, then stamp the header LAST (magic makes it live).
++    // A free slot can retain an orphan header after a stale-index open.
++    zero_slot(slot);
 +    std::memcpy(base_ + page_off(slot), bytes.data(), opts_.slot_size);
 +    Header nh{};
 +    nh.magic     = Header::kMagic;
@@ -1055,9 +1135,9 @@ index 00000000..3e95bdae
 +    nh.last_used = bump_clock();
 +    std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
 +    record_live(id, slot, nh.last_used);
-+    // Structural change (new live page / eviction): persist NOW so the page
-+    // is discoverable across a crash. LRU-only changes are lazy.
-+    persist_index_unlocked();
++    index_dirty_ = true;
++    // Preserve eager publication for direct users; batch workers opt in.
++    if (!opts_.defer_index_updates) { persist_index_unlocked(); }
 +    return true;
 +}
 +
@@ -1077,6 +1157,7 @@ index 00000000..3e95bdae
 +    std::memcpy(dst.data(), base_ + off, opts_.slot_size);
 +    // Read counts as use: refresh LRU in memory (lazy persist).
 +    (*slot_hdr(slot)).last_used = bump_clock();
++    index_dirty_ = true;
 +    return true;
 +}
 +
@@ -1095,6 +1176,7 @@ index 00000000..3e95bdae
 +    const auto it = index_.find(id);
 +    if (it == index_.end()) { return false; }
 +    (*slot_hdr(it->second)).last_used = bump_clock();
++    index_dirty_ = true;
 +    return true;
 +}
 +
@@ -1106,6 +1188,7 @@ index 00000000..3e95bdae
 +    index_.erase(it);
 +    zero_slot(slot);
 +    release_slot(slot);
++    index_dirty_ = true;
 +    persist_index_unlocked();
 +    return true;
 +}
@@ -1113,13 +1196,16 @@ index 00000000..3e95bdae
 +std::vector<DiskKVIdentity> DiskKVStore::evict_until_free(std::uint32_t free) {
 +    std::lock_guard<std::mutex> lock(mu_);
 +    std::vector<DiskKVIdentity> gone;
-+    while (index_.size() + free_slots_.size() < max_slots_ &&
-+           free_slots_.size() < free) {
++    // live + free == capacity normally; requests above capacity saturate.
++    while (free_slots_.size() < free && !index_.empty()) {
 +        auto v = evict_one_lru();
 +        if (!v.has_value()) { break; }
 +        gone.push_back(v->id);
 +    }
-+    if (!gone.empty()) { persist_index_unlocked(); }
++    if (!gone.empty()) {
++        index_dirty_ = true;
++        persist_index_unlocked();
++    }
 +    return gone;
 +}
 +
@@ -1142,10 +1228,10 @@ index 00000000..3e95bdae
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_store.h b/src/core/disk_kv_store.h
 new file mode 100644
-index 00000000..99bffb16
+index 00000000..e36d0cdc
 --- /dev/null
 +++ b/src/core/disk_kv_store.h
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,205 @@
 +#pragma once
 +// L3 (disk) tier for the KV cache hierarchy — persistent, self-describing,
 +// true-LRU.
@@ -1164,7 +1250,8 @@ index 00000000..99bffb16
 +//     placement is managed by the store (free pool), NOT by a hash of the
 +//     identity — identity->slot lives in the index.
 +//   * INDEX file (<path>.idx): the identity->slot mapping, rewritten
-+//     atomically (tmp + fsync + rename) whenever the live set changes.
++//     atomically (tmp + rename) whenever the live set changes by default.
++//     No power-loss durability guarantee (no fsync/msync).
 +//   * Open: valid index -> fast path. Missing/corrupt index -> rebuild by
 +//     scanning slot headers (slow, one-time; CRC-verified).
 +//
@@ -1216,6 +1303,11 @@ index 00000000..99bffb16
 +        std::size_t capacity_bytes = 0; // 0 = invalid (one of the two is required)
 +        std::uint32_t max_slots   = 0;  // explicit capacity (preferred)
 +        bool verify_crc          = true;
++        // Opt-in for workers calling flush_index() at batch/idle/shutdown.
++        // Defers new-page publication ONLY; explicit evictions stay eager.
++        // Crash/close before flush can lose new pages, never trust stale rows.
++        // Destructor does not flush; owner must flush before shutdown.
++        bool defer_index_updates = false;
 +    };
 +
 +    /** Open the backing file and the identity index. Throws on I/O errors or
@@ -1264,8 +1356,8 @@ index 00000000..99bffb16
 +    /** Slot indices currently live (diagnostics). */
 +    [[nodiscard]] std::vector<std::uint32_t> live_slot_list() const;
 +
-+    /** Public durability point (worker thread / tests): persist pending
-+     *  in-memory LRU/index changes to the index file. */
++    /** Publish pending LRU/index changes (batch/idle/shutdown barrier).
++     *  Atomic replacement, NOT an fsync/power-loss durability barrier. */
 +    void flush_index();
 +
 +    static constexpr std::size_t kSlotHeaderSize = 48;
@@ -1338,6 +1430,7 @@ index 00000000..99bffb16
 +    std::uint32_t max_slots_ = 0;
 +    std::uint64_t clock_     = 0;
 +    bool         rebuilt_from_scan_ = false;
++    bool         index_dirty_ = false; // protected by mu_ after construction
 +
 +    std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
 +    std::vector<std::uint32_t> free_slots_;
@@ -1345,7 +1438,7 @@ index 00000000..99bffb16
 +
 +} // namespace ninfer
 diff --git a/src/runtime/contract/types.h b/src/runtime/contract/types.h
-index 010dbad7..0d2e1c6a 100644
+index 010dbad7..c45652aa 100644
 --- a/src/runtime/contract/types.h
 +++ b/src/runtime/contract/types.h
 @@ -160,6 +160,8 @@ struct ResolvedExecutionOptions {
@@ -1357,7 +1450,17 @@ index 010dbad7..0d2e1c6a 100644
  };
  
  struct ResolvedRequestOptions {
-@@ -600,6 +602,10 @@ struct PrefillStepResult {
+@@ -318,6 +320,9 @@ enum class ContextTransactionStatus : std::uint8_t {
+     InProgress,
+     Published,
+     Aborted,
++    // Materialization rolled back with complete acknowledgements; retry this request.
++    // Unlike Aborted, this does not mean user cancellation or engine failure.
++    RetryableFailure,
+ };
+ 
+ enum class ContextTransactionReserveStatus : std::uint8_t {
+@@ -600,6 +605,10 @@ struct PrefillStepResult {
      std::uint32_t processed_prompt_tokens = 0;
      bool complete                         = false;
      ExecutionTiming timing;
@@ -1412,7 +1515,7 @@ index ee15cf8a..8a062dbc 100644
      nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                    static_cast<std::uint64_t>(tokens.size()));
 diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
-index d4d9b2d6..00b53f2b 100644
+index d4d9b2d6..abeba240 100644
 --- a/src/runtime/engine/engine_core.h
 +++ b/src/runtime/engine/engine_core.h
 @@ -81,6 +81,7 @@ public:
@@ -1470,6 +1573,45 @@ index d4d9b2d6..00b53f2b 100644
          const std::array<std::uint32_t, 1> lanes{lane};
          phase.finish();
          commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
+@@ -1500,13 +1516,20 @@ private:
+                     MaterializingRequest& control = *materializing_;
+                     const std::uint32_t lane      = control.destination.value;
+                     const auto request            = control.request;
+-                    if (terminal.status == ContextTransactionStatus::Aborted) {
++                    if (terminal.status == ContextTransactionStatus::Aborted ||
++                        terminal.status == ContextTransactionStatus::RetryableFailure) {
+                         if (terminal.activation) {
+                             throw std::logic_error(
+                                 "aborted materialization retained an activation");
+                         }
+                         materializing_.reset();
+-                        complete_detached_cancelled(request);
++                        if (terminal.status == ContextTransactionStatus::RetryableFailure) {
++                            complete_error(request, std::make_exception_ptr(RequestError(
++                                RequestErrorKind::Unavailable,
++                                "materialization spill failed; owner retained; retry request")));
++                        } else {
++                            complete_detached_cancelled(request);
++                        }
+                         request_admission_check();
+                         publish_runtime_stats();
+                         return AdmissionProgress::ControlProgress;
+@@ -2018,7 +2041,15 @@ private:
+                 } catch (...) {}
+                 return;
+             }
++            const bool context_pending = instance_.program->has_context_transaction();
+             execution_lock.unlock();
++            // A context transaction can be waiting on a short async probe/write or CUDA
++            // event. Do not impose a 1ms sleep on every page/ticket; yield to its worker.
++            // Return through the normal boundary for cancellation and decode fairness.
++            if (context_pending) {
++                std::this_thread::yield();
++                continue;
++            }
+             std::unique_lock wait_lock(queue_mutex_);
+             queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
+         }
 diff --git a/src/runtime/engine/request_record.h b/src/runtime/engine/request_record.h
 index 4def8a67..89de8b57 100644
 --- a/src/runtime/engine/request_record.h
@@ -1485,7 +1627,7 @@ index 4def8a67..89de8b57 100644
      std::mutex mutex;
      std::condition_variable cv;
 diff --git a/src/runtime/engine/resource_manager.h b/src/runtime/engine/resource_manager.h
-index f14837e2..1368e361 100644
+index f14837e2..5c9b1f5e 100644
 --- a/src/runtime/engine/resource_manager.h
 +++ b/src/runtime/engine/resource_manager.h
 @@ -769,7 +769,8 @@ public:
@@ -1538,7 +1680,32 @@ index f14837e2..1368e361 100644
          case RetentionClass::LiveSession:
              return 16;
          case RetentionClass::SharedStable:
-@@ -3362,6 +3387,7 @@ private:
+@@ -2703,7 +2728,8 @@ private:
+         };
+ 
+         const bool published = result.status == ContextTransactionStatus::Published;
+-        if ((!published && result.status != ContextTransactionStatus::Aborted) ||
++        if ((!published && result.status != ContextTransactionStatus::Aborted &&
++             result.status != ContextTransactionStatus::RetryableFailure) ||
+             published != result.published.has_value()) {
+             throw std::logic_error("materialization terminal status is invalid");
+         }
+@@ -2880,12 +2906,12 @@ private:
+         observe_transfers(result);
+         observe_operations(result);
+ 
+-        if (result.status == ContextTransactionStatus::Aborted) {
++        if (!published) {
+             restore_unreported_materialization(*record);
+             lanes_[record->destination.value] = LogicalLaneState::Free;
+             transaction_.template emplace<std::monostate>();
+             program.finalize_context_transaction();
+-            return {.status = ContextTransactionStatus::Aborted};
++            return {.status = result.status};
+         }
+ 
+         CatalogEntry& publication = catalog_[record->publication_slot];
+@@ -3362,6 +3388,7 @@ private:
      std::uint32_t catalog_count_        = 0;
      std::uint32_t shared_catalog_count_ = 0;
      bool cache_enabled_                 = true;
@@ -1744,7 +1911,7 @@ index 75c71383..29c8664d 100644
                                              const StopPolicy& caller_stop,
                                              const OutputOptions& output,
 diff --git a/src/targets/qwen3_6/impl/runtime/program.h b/src/targets/qwen3_6/impl/runtime/program.h
-index fcee5fc8..3eb48468 100644
+index fcee5fc8..8b0d81ef 100644
 --- a/src/targets/qwen3_6/impl/runtime/program.h
 +++ b/src/targets/qwen3_6/impl/runtime/program.h
 @@ -5,6 +5,7 @@
@@ -1827,7 +1994,66 @@ index fcee5fc8..3eb48468 100644
      TokenId* host_tokens = nullptr;
      std::optional<PinnedHostBuffer> ordinary_host;
      qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
-@@ -872,6 +898,11 @@ private:
+@@ -783,6 +809,41 @@ private:
+         std::uint8_t timer_mask    = 0;
+     };
+ 
++    struct OwnerSpillProgress {
++        // Full main/backend chains, endpoint state, seam tails, seam state.
++        std::uint8_t stage = 0;
++        std::uint32_t page = 0;
++        bool probed = false;
++        bool writing = false;
++        bool ready = false;
++        bool failed = false;
++        SpillTicket ticket;
++        std::optional<CudaCompletionEvent> copy_done;
++        LogicalKVPageStore* pinned_store = nullptr;
++        std::optional<LogicalKVPageHandle> pinned_page;
++        std::span<const std::byte> bytes;
++        std::uint64_t saved = 0, dedup = 0, d2h = 0;
++        std::uint64_t state_saved = 0;  // endpoint/seam state images actually written
++        bool endpoint_valid_at_start = false;  // diagnostics: stage-2 gate
++        bool seam_valid_at_start = false;      // diagnostics: stage-3..5 gate
++        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
++        // Batched D2H for device-only chain pages: consecutive pages are pinned,
++        // copied in ONE transfer + ONE event into the reserved scratch, then
++        // submitted as individual tickets (per-page ~6ms pin+copy+event round
++        // trips dominated cold-owner spill time).
++        std::vector<LogicalKVPageHandle> batch_pages;       // pinned device pages
++        std::vector<DeviceKVPageHandle> batch_physical;     // their device handles
++        std::vector<DiskKVIdentity> batch_ids;              // page-order identities
++        std::vector<SpillTicket> batch_tickets;             // submitted writes
++        std::uint32_t batch_submit = 0;                     // next id to submit
++        DiskKVKind batch_kind = DiskKVKind::MainKV;
++        std::size_t batch_stride = 0;
++        bool batch_copy_pending = false;
++    };
++    bool progress_owner_spill(SequenceState& sequence, OwnerSpillProgress& progress);
++    bool owner_spill_pending(const OwnerSpillProgress& progress) const;
++    void cleanup_owner_spill(OwnerSpillProgress& progress) noexcept;
++
+     struct MaterializationTransaction {
+         struct KVRestorePage {
+             LogicalKVPageHandle logical;
+@@ -816,6 +877,7 @@ private:
+             bool checkpoint_drop_published = false;
+             bool mutation_published        = false;
+             std::uint64_t spill_pages      = 0;
++            std::optional<OwnerSpillProgress> owner_spill;
+         };
+ 
+         std::uint64_t id = 0;
+@@ -834,6 +896,8 @@ private:
+         std::vector<bool> victim_released;
+         std::vector<PressureWork> pressure;
+         std::vector<MaterializationVictimResult> pressure_results;
++        std::size_t host_release_cursor = 0;
++        std::size_t shared_host_release_cursor = 0;
+         std::size_t pressure_cursor = 0;
+         std::size_t victim_count    = 0;
+         std::vector<std::uint32_t> shared_victim_indices;
+@@ -872,6 +936,11 @@ private:
          std::vector<DeviceKVPageHandle> backend_restore_destinations;
          std::vector<runtime::ContextTransferObservation> transfer_observations;
          runtime::ContextOperationCounts operations;
@@ -1839,7 +2065,7 @@ index fcee5fc8..3eb48468 100644
          bool state_restored                 = false;
          bool transfer_submitted             = false;
          std::uint8_t transfer_timer_mask    = 0;
-@@ -1125,6 +1156,27 @@ private:
+@@ -1125,6 +1194,27 @@ private:
          std::vector<runtime::CheckpointRecoveryAlternativeWork>& alternatives,
          PressureRecoveryScratch& scratch, std::uint64_t& projection_work) const;
      void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
@@ -1867,8 +2093,26 @@ index fcee5fc8..3eb48468 100644
      [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
      [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
                                              const runtime::BatchedGeneratedRound& round);
+@@ -1133,7 +1223,7 @@ private:
+     [[nodiscard]] const SequenceState& active_sequence(std::uint32_t lane) const;
+     [[nodiscard]] std::optional<std::uint32_t> allocate_continuation_slot() noexcept;
+     [[nodiscard]] bool can_release_continuation_slot_strict(std::uint32_t index) const;
+-    void release_continuation_slot_strict(std::uint32_t index) noexcept;
++    void release_continuation_slot_strict(std::uint32_t index, bool already_spilled = false) noexcept;
+     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
+     void retire_continuation_slot(std::uint32_t index) noexcept;
+     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
+@@ -1230,7 +1320,7 @@ private:
+                           std::uint32_t backend_tokens = 0);
+     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
+     void release_active_sequence_kv_strict(SequenceState& sequence) noexcept;
+-    void release_sequence_kv_strict(SequenceState& sequence) noexcept;
++    void release_sequence_kv_strict(SequenceState& sequence, bool already_spilled = false) noexcept;
+     void release_sequence_kv(SequenceState& sequence) noexcept;
+     void commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
+                             std::uint32_t backend_tokens = 0);
 diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
-index e2a84d3d..3f429ff2 100644
+index e2a84d3d..64197e03 100644
 --- a/src/targets/qwen3_6/impl/runtime/program_impl.h
 +++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
 @@ -17,17 +17,27 @@
@@ -1941,7 +2185,7 @@ index e2a84d3d..3f429ff2 100644
 +    // L3 restore scratch: reserve once, up front. A missing reservation only
 +    // disables restores (the admission probe checks the handles) — it is never
 +    // a request-time failure and never contends with live sessions.
-+    if (disk_kv != nullptr && disk_kv_restore && host_kv_arena != nullptr &&
++    if (disk_kv != nullptr && host_kv_arena != nullptr &&
 +        host_state_images != nullptr && text_kv_pages != nullptr) {
 +        const HostKVPageLayout* main_scratch_layout =
 +            host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
@@ -1966,7 +2210,7 @@ index e2a84d3d..3f429ff2 100644
      io = qwen3_6::RoundState(backing, plan.persistent.round);
      if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
          throw std::logic_error("round-state MTP extension does not match the sequence plan");
-@@ -2846,10 +2916,668 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
+@@ -2846,10 +2916,939 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
      } else if (speculative_backend == SpeculativeBackend::DFlash) {
          sequence.dflash_context_frontier = retained->backend_frontier;
      }
@@ -2054,6 +2298,265 @@ index e2a84d3d..3f429ff2 100644
 +// FIRST miss, so only a contiguous prefix from 0 pays: walk from page 0,
 +// stop at the first page that is not host-resident. The bridge is async
 +// (bounded queue + writer thread): the caller pays only memcpys.
++bool ProgramImplCore::owner_spill_pending(const OwnerSpillProgress& p) const {
++    if (p.ticket && DiskKVBridge::poll(p.ticket) == SpillStatus::Pending) { return true; }
++    if (p.copy_done && !p.copy_done->ready()) { return true; }  // single page or batch copy
++    for (const auto& t : p.batch_tickets) {
++        if (DiskKVBridge::poll(t) == SpillStatus::Pending) { return true; }
++    }
++    // Accumulated-but-not-copied pages are NOT in flight: cancellation may
++    // discard them (unpinned in cleanup) instead of waiting forever.
++    return false;
++}
++
++void ProgramImplCore::cleanup_owner_spill(OwnerSpillProgress& p) noexcept {
++    try {
++        // Only exceptional teardown waits. Normal cancellation polls before cleanup.
++        if (p.copy_done) { p.copy_done->synchronize(); }
++        if (p.ticket && DiskKVBridge::poll(p.ticket) == SpillStatus::Pending) {
++            disk_kv->wait_idle();
++        }
++        if (p.pinned_page) { p.pinned_store->unpin_source(*p.pinned_page); }
++        p.pinned_page.reset();
++        if (!p.batch_pages.empty()) {
++            if (p.pinned_store) {
++                for (const auto& h : p.batch_pages) { p.pinned_store->unpin_source(h); }
++            }
++        }
++        p.batch_pages.clear();
++        p.batch_physical.clear();
++        p.batch_ids.clear();
++        p.batch_tickets.clear();
++        p.batch_submit = 0;
++        p.batch_kind = DiskKVKind::MainKV;
++        p.batch_stride = 0;
++        p.batch_copy_pending = false;
++        p.pinned_store = nullptr;
++        p.copy_done.reset();
++        p.ticket.reset();
++        p.bytes = {};
++        p.ready = p.probed = p.writing = false;
++    } catch (...) { std::terminate(); }
++}
++
++bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillProgress& p) {
++    if (!disk_kv || !sequence.kv) { return true; }
++    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
++    const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
++        (static_cast<std::uint32_t>(proposal_head) << 8U) |
++        (static_cast<std::uint32_t>(kv_storage) << 16U);
++    const bool seam = sequence.rewrite_checkpoint.valid && sequence.rewrite_state &&
++        sequence.rewrite_checkpoint.frontier != 0 &&
++        sequence.rewrite_checkpoint.frontier < sequence.execution_frontier;
++    // Each call processes at most 8 entries / 2ms. Neither disk nor CUDA is waited here.
++    for (unsigned budget = 0; budget < 8 && std::chrono::steady_clock::now() < until; ++budget) {
++        // ---- batched D2H bookkeeping (drains before any page work) ----
++        if (p.batch_copy_pending) {
++            if (!p.copy_done || !p.copy_done->ready()) { return false; }
++            p.copy_done.reset();
++            p.batch_copy_pending = false;
++        }
++        if (!p.batch_ids.empty()) {
++            if (!p.batch_tickets.empty()) {
++                for (const auto& t : p.batch_tickets) {
++                    const SpillStatus st = DiskKVBridge::poll(t);
++                    if (st == SpillStatus::Pending) { return false; }
++                    if (st == SpillStatus::Failed) { p.failed = true; return false; }
++                    ++p.saved;
++                    if (st == SpillStatus::Present) { ++p.dedup; }
++                }
++                p.batch_tickets.clear();
++                if (p.batch_submit < p.batch_ids.size()) {
++                    return false;  // resume submission next round
++                }
++                // Fully submitted and drained: release the batch.
++                if (p.pinned_store) {
++                    for (const auto& h : p.batch_pages) { p.pinned_store->unpin_source(h); }
++                }
++                p.batch_pages.clear();
++                p.batch_physical.clear();
++                p.batch_ids.clear();
++                p.batch_submit = 0;
++                p.batch_kind = DiskKVKind::MainKV;
++                p.batch_stride = 0;
++                p.pinned_store = nullptr;
++                continue;  // batch work consumed this entry
++            }
++            if (p.batch_submit < p.batch_ids.size()) {
++                if (!p.copy_done && !p.batch_copy_pending) {
++                    // Accumulated but not yet copied: one transfer + one event
++                    // into the reserved scratch, then submit as tickets.
++                    HostKVAllocationView view =
++                        host_kv_arena->writable_view(*(p.batch_kind == DiskKVKind::BackendKV
++                                                          ? l3_backend_scratch
++                                                          : l3_kv_scratch))
++                            .subview(0, static_cast<std::uint32_t>(p.batch_ids.size()));
++                    p.copy_done.emplace(device);
++                    p.pinned_store->physical_pool().copy_to_host(
++                        std::span<const DeviceKVPageHandle>(p.batch_physical), view,
++                        device.transfer_stream);
++                    p.copy_done->record(device.transfer_stream);
++                    p.batch_copy_pending = true;
++                    return false;
++                }
++                // Submit the batch as individual tickets (bytes borrow the
++                // scratch pages; the worker reads them off the engine thread).
++                HostKVAllocationView view =
++                    host_kv_arena->writable_view(*(p.batch_kind == DiskKVKind::BackendKV
++                                                      ? l3_backend_scratch
++                                                      : l3_kv_scratch));
++                for (; p.batch_submit < p.batch_ids.size(); ++p.batch_submit) {
++                    const auto page_view = view.subview(p.batch_submit, 1);
++                    SpillTicket t = disk_kv->try_submit(
++                        p.batch_ids[p.batch_submit], p.batch_kind,
++                        std::span<const std::byte>(page_view.data(), p.batch_stride));
++                    if (!t) { return false; }  // queue busy: retry next round
++                    p.batch_tickets.push_back(std::move(t));
++                }
++                return false;  // wait for the batch tickets
++            }
++        }
++        if (p.stage == 6) { return true; }
++        const bool backend = p.stage == 1 || p.stage == 4;
++        const bool state = p.stage == 2 || p.stage == 5;
++        const bool tail = p.stage == 3 || p.stage == 4;
++        auto next_stage = [&] { ++p.stage; p.page = 0; };
++        if ((p.stage >= 3 && !seam) ||
++            (backend && (!sequence.kv->backend || !backend_kv_pages))) {
++            next_stage(); continue;
++        }
++        std::uint32_t frontier = p.stage >= 3 ? sequence.rewrite_checkpoint.frontier :
++                                             sequence.execution_frontier;
++        if (backend) { frontier = backend_frontier_at(speculative_backend, frontier); }
++        if (frontier == 0 || (state && p.stage == 2 && !sequence.endpoint_valid) ||
++            (tail && frontier % kPagedKVPageSize == 0)) {
++            next_stage(); continue;
++        }
++        auto* addresses = backend ? backend_kv_addresses.get() : text_kv_addresses.get();
++        auto* pages = backend ? backend_kv_pages.get() : text_kv_pages.get();
++        const auto address = backend ? *sequence.kv->backend : sequence.kv->text;
++        const auto kind = state ? DiskKVKind::StateImage :
++                                 (backend ? DiskKVKind::BackendKV : DiskKVKind::MainKV);
++        LogicalKVPageHandle logical{};
++        if (!state) {
++            const auto count = kv_pages_for_frontier(frontier);
++            if (!tail && p.page >= count) { next_stage(); continue; }
++            const std::uint32_t page = tail ? frontier / kPagedKVPageSize : p.page;
++            // Never truncate the chain or release an owner after an unreadable page.
++            if (!addresses || !pages || page >= addresses->mapped_pages(address)) {
++                p.failed = true; return false;
++            }
++            logical = addresses->logical_page(address, page);
++            if (!tail) {
++                const auto required = std::min<std::uint32_t>(kPagedKVPageSize,
++                    frontier - page * kPagedKVPageSize);
++                if (pages->committed_columns(logical) < required) { p.failed = true; return false; }
++                frontier = page * kPagedKVPageSize + required;
++            }
++        }
++        if (frontier >= sequence.prefix_digests.size()) { p.failed = true; return false; }
++        const auto digest = sequence.prefix_digests.at(frontier);
++        const DiskKVIdentity id{.lo=digest[0], .hi=digest[1], .tag=tag, .frontier=frontier};
++        auto complete = [&] {
++            cleanup_owner_spill(p);
++            ++p.saved;
++            if (state) { ++p.state_saved; }
++            if (state || tail) { next_stage(); } else { ++p.page; }
++        };
++        if (p.ticket) {
++            const auto result = DiskKVBridge::poll(p.ticket);
++            if (result == SpillStatus::Pending) { return false; }
++            p.ticket.reset();
++            if (result == SpillStatus::Failed) { p.failed = true; return false; }
++            if (p.writing || result == SpillStatus::Present) {
++                if (!p.writing) { ++p.dedup; }
++                complete(); continue;
++            }
++            p.probed = true;
++        }
++        if (!p.probed) {
++            p.ticket = disk_kv->try_probe(id, kind);
++            return false; // dedupe BEFORE any D2H; Busy preserves cursor/owner
++        }
++        if (p.copy_done) {
++            if (!p.copy_done->ready()) { return false; }
++            p.copy_done.reset();
++            p.ready = true;
++        }
++        if (!p.ready) {
++            if (state) {
++                const auto handle = p.stage == 2 ? sequence.state.read : *sequence.rewrite_state;
++                if (!state_store->valid(handle)) { p.failed = true; return false; }
++                const auto stride = static_cast<std::size_t>(state_images->host_layout().image_bytes);
++                if (const auto view = state_store->host_view(handle)) {
++                    // Fixed host slots do not compact. This catalogued victim is
++                    // exclusively claimed by the global context transaction; active
++                    // work cannot mutate it, and abort waits for its ticket before
++                    // returning the claim. The borrow therefore lasts through ack.
++                    p.bytes = {view->data, stride}; p.ready = true;
++                } else {
++                    if (!l3_state_scratch) { p.failed = true; return false; }
++                    auto scratch_view = host_state_images->writable_view(*l3_state_scratch);
++                    p.copy_done.emplace(device);
++                    state_images->copy_to_host(state_store->physical_slot(handle), scratch_view,
++                                               device.transfer_stream);
++                    p.copy_done->record(device.transfer_stream);
++                    p.bytes = {scratch_view.data, stride}; ++p.d2h;
++                    return false;
++                }
++            } else {
++                // can_pin_source is DEVICE-only; a retained immutable host replica
++                // can be pinned directly to prevent extent compaction while borrowed.
++                const auto stride = backend ? backend_host_kv_page_stride : text_host_kv_page_stride;
++                if (pages->host_resident(logical)) {
++                    pages->pin_source(logical); p.pinned_store = pages; p.pinned_page = logical;
++                    const auto replica = pages->host_replica(logical);
++                    const auto view = host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
++                    p.bytes = {view.data(), stride}; p.ready = true;
++                } else if (pages->device_resident(logical)) {
++                    if (!tail) {
++                        // Batched D2H: consecutive device-only chain pages are
++                        // pinned, copied in ONE transfer + ONE event into the
++                        // reserved scratch, then submitted as individual tickets.
++                        // (Per-page pin+copy+event round trips ~6ms each made a
++                        // cold 1.7k-page owner take ~10s.)
++                        if (p.batch_ids.size() >= kL3ScratchPages) { return false; }
++                        if (!pages->can_pin_source(logical)) { return false; }
++                        auto& scratch = backend ? l3_backend_scratch : l3_kv_scratch;
++                        if (!scratch) { p.failed = true; return false; }
++                        pages->pin_source(logical);
++                        p.pinned_store = pages;
++                        p.batch_pages.push_back(logical);
++                        p.batch_physical.push_back(pages->physical(logical));
++                        p.batch_ids.push_back(id);
++                        p.batch_kind = kind;
++                        p.batch_stride = stride;
++                        ++p.page;
++                        ++p.d2h;
++                        continue;  // accumulate (budget-limited)
++                    }
++                    // Seam tails are single pages: keep the one-shot flow.
++                    if (!pages->can_pin_source(logical)) { return false; }
++                    pages->pin_source(logical); p.pinned_store = pages; p.pinned_page = logical;
++                    auto& scratch = backend ? l3_backend_scratch : l3_kv_scratch;
++                    if (!scratch) { p.failed = true; return false; }
++                    auto view = host_kv_arena->writable_view(*scratch).subview(0, 1);
++                    const auto physical = pages->physical(logical);
++                    p.copy_done.emplace(device);
++                    pages->physical_pool().copy_to_host({&physical, 1}, view, device.transfer_stream);
++                    p.copy_done->record(device.transfer_stream);
++                    p.bytes = {view.data(), stride}; ++p.d2h;
++                    return false;
++                } else { p.failed = true; return false; }
++            }
++        }
++        p.ticket = disk_kv->try_submit(id, kind, p.bytes);
++        if (p.ticket) { p.writing = true; }
++        return false;
++    }
++    return p.stage == 6;
++}
++
 +void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
 +    if (disk_kv == nullptr || !sequence.kv || !host_kv_extents || !text_kv_addresses ||
 +        !text_kv_pages) {
@@ -2077,13 +2580,25 @@ index e2a84d3d..3f429ff2 100644
 +            const std::uint32_t page_cap =
 +                std::min(std::min(total_pages, kOwnerSpillCap), mapped);
 +            if (page_cap == 0) { return; }
++            const auto spill_started = Clock::now();
 +            std::vector<std::byte> scratch(stride);
 +            std::uint32_t spilled = 0;
++            std::uint32_t duplicate_pages = 0;
++            std::uint32_t device_copies = 0;
 +            for (std::uint32_t p = 0; p < page_cap; ++p) {
 +                const LogicalKVPageHandle logical = addresses.logical_page(address, p);
 +                const std::uint32_t page_frontier =
 +                    p * static_cast<std::uint32_t>(kPagedKVPageSize) + pages.committed_columns(logical);
 +                if (page_frontier >= sequence.prefix_digests.size()) { break; }
++                // Check identity before paying for host copies or D2H transfers.
++                const auto digest = sequence.prefix_digests.at(page_frontier);
++                const DiskKVIdentity id{.lo = digest[0], .hi = digest[1],
++                                        .tag = tag, .frontier = page_frontier};
++                if (disk_kv->contains(id, kind)) {
++                    ++duplicate_pages;
++                    ++spilled;
++                    continue;
++                }
 +                // Every live replica is either host- or device-resident: the
 +                // pressure pipeline demotes device->host and never drops a sole
 +                // replica. Host pages read directly; device-only pages get a
@@ -2108,6 +2623,7 @@ index e2a84d3d..3f429ff2 100644
 +                            if (device.transfer_stream != nullptr) {
 +                                (void)cudaStreamSynchronize(device.transfer_stream);
 +                            }
++                            ++device_copies;
 +                            std::memcpy(scratch.data(),
 +                                        host_kv_extents->writable_view(*reservation).data(), stride);
 +                            ok = true;
@@ -2131,11 +2647,6 @@ index e2a84d3d..3f429ff2 100644
 +                            host_kv_extents->occupied(), host_kv_extents->capacity(), spilled);
 +                    break;  // page unreadable: prefix ends here
 +                }
-+                const auto digest = sequence.prefix_digests.at(page_frontier);
-+                const DiskKVIdentity id{.lo     = digest[0],
-+                                        .hi     = digest[1],
-+                                        .tag    = tag,
-+                                        .frontier = page_frontier};
 +                if (!disk_kv->spill_page_wait(
 +                        id, kind, std::span<const std::byte>(scratch.data(), stride),
 +                        std::chrono::milliseconds(5000))) {
@@ -2149,8 +2660,12 @@ index e2a84d3d..3f429ff2 100644
 +                }
 +                ++spilled;
 +            }
-+            fprintf(stderr, "[l3-spill] kind=%d done total=%u spilled=%u\n",
-+                    static_cast<int>(kind), page_cap, spilled);
++            const double spill_seconds =
++                std::chrono::duration<double>(Clock::now() - spill_started).count();
++            fprintf(stderr,
++                    "[l3-spill] kind=%d done total=%u spilled=%u dedup=%u d2h=%u elapsed=%.3fs\n",
++                    static_cast<int>(kind), page_cap, spilled, duplicate_pages,
++                    device_copies, spill_seconds);
 +        };
 +        const std::uint32_t main_pages = kv_pages_for_frontier(sequence.execution_frontier);
 +        spill_prefix(*text_kv_addresses, *text_kv_pages, sequence.kv->text, main_pages,
@@ -2635,7 +3150,7 @@ index e2a84d3d..3f429ff2 100644
  qwen3_6::detail::PressureDecision
  ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
      qwen3_6::detail::PressureDecision option;
-@@ -4452,6 +5180,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+@@ -4452,6 +5451,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
          materialization_identity_.assign(prompt);
          materialization_prefix_digests_.assign(prompt);
  
@@ -2681,7 +3196,7 @@ index e2a84d3d..3f429ff2 100644
          const std::uint32_t initial_mtp_extent =
              speculative_backend == SpeculativeBackend::Mtp
                  ? std::min({draft_window,
-@@ -4465,8 +5232,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+@@ -4465,8 +5503,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
              .vision_plan        = std::move(request_plan.vision),
              .vision             = nullptr,
              .capture_groups     = std::move(request_plan.capture_groups),
@@ -2698,7 +3213,109 @@ index e2a84d3d..3f429ff2 100644
              .prompt_tokens      = prompt_tokens,
              .initial_mtp_extent = initial_mtp_extent,
              .elapsed_seconds    = 0.0,
-@@ -7074,6 +7847,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
+@@ -5807,6 +6851,7 @@ void ProgramImplCore::publish_pressure_work(
+ 
+ void ProgramImplCore::abort_pressure_work(MaterializationTransaction::PressureWork& work) noexcept {
+     try {
++        if (work.owner_spill) { cleanup_owner_spill(*work.owner_spill); work.owner_spill.reset(); }
+         if (work.completed) { return; }
+         for (auto& change : work.state_changes) {
+             if (change.transfer) {
+@@ -5842,7 +6887,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
+     }
+ 
+     out.delta.removed = resident_resources(continuation_states[index]);
+-    release_continuation_slot_strict(index);
++    release_continuation_slot_strict(index, true);
+     if (transaction.root_waiting_for_victim && transaction.root_continuation_index == index) {
+         continuation_slots[index].role      = ContinuationSlotRole::ReservedMaterialization;
+         transaction.root_waiting_for_victim = false;
+@@ -5980,11 +7025,20 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
+ 
+     if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
+         if (transaction.cancel_pending) {
++            // A borrowed state/page or scratch D2H must finish before owner claims return.
++            for (auto& work : transaction.pressure) {
++                if (work.owner_spill && owner_spill_pending(*work.owner_spill)) {
++                    out.status = runtime::ContextTransactionStatus::InProgress;
++                    return out;
++                }
++            }
+             abort_transaction();
+             return out;
+         }
+-        for (std::size_t position = 0; position < transaction.shared_victim_count; ++position) {
++        for (auto& position = transaction.shared_host_release_cursor;
++             position < transaction.shared_victim_count; ++position) {
+             MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
++            if (work.completed) { continue; }
+             if (work.option.evicts_continuation) {
+                 const std::uint32_t index      = transaction.shared_victim_indices[position];
+                 const std::uint64_t generation = transaction.shared_victim_generations[position];
+@@ -6020,9 +7074,46 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
+                 publish_pressure_host_releases(work);
+             }
+         }
+-        for (std::size_t position = 0; position < transaction.victim_count; ++position) {
++        for (auto& position = transaction.host_release_cursor;
++             position < transaction.victim_count; ++position) {
+             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
++            if (work.completed) { continue; }
+             if (work.option.evicts_continuation) {
++                const auto index = transaction.victim_indices[position];
++                if (index >= continuation_capacity ||
++                    continuation_slots[index].generation != transaction.victim_generations[position] ||
++                    continuation_slots[index].role != ContinuationSlotRole::Catalogued) {
++                    throw std::logic_error("owner spill victim changed while retained");
++                }
++                if (!work.owner_spill) {
++                    work.owner_spill.emplace();
++                    work.owner_spill->endpoint_valid_at_start =
++                        continuation_states[index].endpoint_valid;
++                    work.owner_spill->seam_valid_at_start =
++                        continuation_states[index].rewrite_checkpoint.valid &&
++                        static_cast<bool>(continuation_states[index].rewrite_state);
++                }
++                auto& spill = *work.owner_spill;
++                if (!progress_owner_spill(continuation_states[index], spill)) {
++                    if (spill.failed) {
++                        fprintf(stderr, "[l3-spill] owner retained: stage=%u page=%u write/read failed\n",
++                                spill.stage, spill.page);
++                        abort_transaction();
++                        out.status = runtime::ContextTransactionStatus::RetryableFailure;
++                    } else { out.status = runtime::ContextTransactionStatus::InProgress; }
++                    return out;
++                }
++                fprintf(stderr,
++                        "[l3-spill] owner done saved=%llu dedup=%llu d2h=%llu state=%llu "
++                        "ep=%d seam=%d elapsed=%.3fs\n",
++                        static_cast<unsigned long long>(spill.saved),
++                        static_cast<unsigned long long>(spill.dedup),
++                        static_cast<unsigned long long>(spill.d2h),
++                        static_cast<unsigned long long>(spill.state_saved),
++                        static_cast<int>(spill.endpoint_valid_at_start),
++                        static_cast<int>(spill.seam_valid_at_start),
++                        std::chrono::duration<double>(std::chrono::steady_clock::now() - spill.started).count());
++                cleanup_owner_spill(spill);
+                 const PhysicalReleaseResult released =
+                     release_materialization_victim(transaction, position);
+                 if (released.status != runtime::ConsumeStatus::Consumed ||
+@@ -6546,12 +7637,12 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index)
+     return true;
+ }
+ 
+-void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index) noexcept {
++void ProgramImplCore::release_continuation_slot_strict(std::uint32_t index, bool already_spilled) noexcept {
+     try {
+         if (!can_release_continuation_slot_strict(index)) { std::terminate(); }
+     } catch (...) { std::terminate(); }
+     SequenceState& sequence = continuation_states[index];
+-    release_sequence_kv_strict(sequence);
++    release_sequence_kv_strict(sequence, already_spilled);
+     release_sequence_state_strict(sequence);
+     retire_continuation_slot(index);
+ }
+@@ -7074,6 +8165,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
      out.processed_prompt_tokens = step.processed_prompt_tokens;
      out.complete                = step.complete;
      out.timing                  = step.timing;
@@ -2706,7 +3323,7 @@ index e2a84d3d..3f429ff2 100644
      if (step.complete) {
          const std::array<std::uint32_t, 1> lanes{lane};
          const runtime::BatchedGeneratedRound round{
-@@ -9905,7 +10679,47 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
+@@ -9905,7 +10997,47 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
              : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                  : 0U;
          materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
@@ -2754,15 +3371,20 @@ index e2a84d3d..3f429ff2 100644
          sequence.rope_delta = staged.prompt.rope_delta;
          set_device_i32(io.rope_delta, sequence.rope_delta);
  
-@@ -10847,6 +11661,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+@@ -10843,10 +11975,11 @@ void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence)
+     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+ }
+ 
+-void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexcept {
++void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence, bool already_spilled) noexcept {
      if (!sequence.kv || !text_kv_addresses || !text_kv_addresses->can_release(sequence.kv->text)) {
          std::terminate();
      }
-+    spill_dying_owner_pages(sequence);  // before any release: pages must be readable
++    if (!already_spilled) { spill_dying_owner_pages(sequence); }
      if (sequence.kv->backend &&
          (!backend_kv_addresses || !backend_kv_addresses->can_release(*sequence.kv->backend))) {
          std::terminate();
-@@ -10861,6 +11676,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+@@ -10861,6 +11994,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
  
  void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
      if (!sequence.kv) { return; }
@@ -2770,7 +3392,7 @@ index e2a84d3d..3f429ff2 100644
      unbind_sequence_kv(sequence);
      if (sequence.kv->backend && backend_kv_addresses) {
          (void)backend_kv_addresses->release(*sequence.kv->backend);
-@@ -11388,6 +12204,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
+@@ -11388,6 +12522,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
      }
  }
  
@@ -2817,7 +3439,7 @@ index e2a84d3d..3f429ff2 100644
  runtime::PrefillStepResult
  ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
                                   runtime::ExecutionTiming* failed_timing) {
-@@ -11400,10 +12256,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11400,10 +12574,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
      if (staged.pending_capture_offer != 0) {
          throw std::logic_error("prefill cannot advance while a capture offer is pending");
      }
@@ -2849,7 +3471,7 @@ index e2a84d3d..3f429ff2 100644
      const auto started                    = Clock::now();
      try {
          if (staged.next_capture < staged.capture_groups.size() &&
-@@ -11428,10 +12302,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11428,10 +12620,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
              rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
              rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
          }
@@ -2870,7 +3492,7 @@ index e2a84d3d..3f429ff2 100644
              text_kv_view(sequence),
              mtp_kv_view(sequence),
              decoder->text_kv,
-@@ -11559,7 +12442,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11559,7 +12760,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                          staged.pending_capture_offer = next_capture_offer_id_;
                          return runtime::PrefillStepResult{
                              .summary                 = summary,
@@ -2879,7 +3501,7 @@ index e2a84d3d..3f429ff2 100644
                              .timing                  = timing.finish(),
                          };
                      }
-@@ -11577,7 +12460,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11577,7 +12778,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                      std::chrono::duration<double>(Clock::now() - started).count();
                  return runtime::PrefillStepResult{
                      .summary                 = summary,
@@ -2888,7 +3510,7 @@ index e2a84d3d..3f429ff2 100644
                      .timing                  = timing.finish(),
                  };
              }
-@@ -11624,6 +12507,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11624,6 +12825,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          timing.begin_wait();
          device.synchronize();
          timing.end_wait();
@@ -2900,7 +3522,7 @@ index e2a84d3d..3f429ff2 100644
          staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
          const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
          const std::uint32_t prompt_tokens = staged.prompt_tokens;
-@@ -11653,7 +12541,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11653,7 +12859,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
          staged.prompt.release_all_media_payloads();
          if (staged.vision) { staged.vision->retire_handoff(); }
@@ -2908,7 +3530,7 @@ index e2a84d3d..3f429ff2 100644
          const bool prompt_frontier_capture =
              staged.next_capture < staged.capture_groups.size() &&
              staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-@@ -11667,9 +12554,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11667,9 +12872,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          return runtime::PrefillStepResult{
              .summary = summary,
              .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
@@ -3255,3 +3877,95 @@ index 40ccda9d..4030d70a 100644
      state.execution.work.reset();
  }
  
+diff --git a/tests/test_resource_manager.cpp b/tests/test_resource_manager.cpp
+index fb6bc8de..da451fa3 100644
+--- a/tests/test_resource_manager.cpp
++++ b/tests/test_resource_manager.cpp
+@@ -880,9 +880,10 @@ public:
+         result.status = (abort_progress || cancellation.requested())
+                             ? ContextTransactionStatus::Aborted
+                             : ContextTransactionStatus::Published;
++        if (retryable_spill_failure) { result.status = ContextTransactionStatus::RetryableFailure; }
+         for (std::size_t index = 0; index < plan.private_actions.size(); ++index) {
+             const FakeTargetDecision& action = plan.private_actions[index];
+-            const bool evicted               = action.evicts_continuation;
++            const bool evicted = action.evicts_continuation && !retryable_spill_failure;
+             FakeMaterializationVictimResult victim{
+                 .owner       = plan.private_planning_ids[index],
+                 .disposition = evicted ? VictimDisposition::Evicted : VictimDisposition::Retained,
+@@ -893,11 +894,11 @@ public:
+                 const std::uint32_t owner_id = plan.private_owner_ids.at(index);
+                 victim.final_summary.emplace();
+                 const std::uint32_t content = sequence_content_keys_.at(owner_id);
+-                if (action.dropped_checkpoints == 0 || malform_private_checkpoint_identity) {
++                if (retryable_spill_failure || action.dropped_checkpoints == 0 || malform_private_checkpoint_identity) {
+                     victim.final_summary->endpoint = endpoint(content, finish_frontier);
+                 }
+                 if (finish_with_rewrite &&
+-                    (action.dropped_checkpoints == 0 || !malform_private_checkpoint_identity)) {
++                    (retryable_spill_failure || action.dropped_checkpoints == 0 || !malform_private_checkpoint_identity)) {
+                     victim.final_summary->rewrite =
+                         rewrite_checkpoint(content, finish_frontier - 1U);
+                 }
+@@ -926,7 +927,7 @@ public:
+         }
+         if (plan.admission.private_source_id != 0) {
+             result.source = FakeMaterializationSourceResult{
+-                .mode = result.status == ContextTransactionStatus::Aborted
++                .mode = result.status != ContextTransactionStatus::Published
+                             ? PrivateSourceMode::Retain
+                             : plan.admission.source_mode};
+         }
+@@ -1135,6 +1136,7 @@ public:
+     bool report_shared_source_summary                    = false;
+     bool change_shared_source_residency_on_second_report = false;
+     std::uint32_t reported_shared_active_references      = 0;
++    bool retryable_spill_failure = false;
+     ContextTransactionStatus capture_status              = ContextTransactionStatus::Published;
+     FakeCaptureAssessment capture_assessment;
+     FakeContinuationSummary capture_summary;
+@@ -2374,6 +2376,44 @@ void test_stale_revision_is_retryable() {
+ }
+ 
+ void test_materialization_abort_preserves_source() {
++    // Exercise retryable I/O failure separately from cancellation, including a
++    // planned owner eviction whose bytes have not been acknowledged by the writer.
++    {
++        FakeManager manager = make_manager(1, 2);
++        FakeProgram program;
++        const auto seed = start_active(manager, program, 50, make_base(50), 1);
++        (void)finish_active(manager, program, seed);
++        program.required_pressure_actions = 1;
++        program.require_evictions = true;
++        auto inspection = manager.inspect(program, FakePreparedPrompt{51}, make_base(51), 2);
++        require(inspection.choice.has_value(), "retryable spill test has no pressure plan");
++        program.retryable_spill_failure = true;
++        require(manager.reserve_materialization(program, std::move(*inspection.choice),
++                    FakePreparedPrompt{51}, {}) == FakeManager::MaterializationReserveResult::Reserved,
++                "retryable spill test could not reserve");
++        auto progress = manager.progress_context_transaction(program, {});
++        auto outcome = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
++        require(outcome.status == ContextTransactionStatus::RetryableFailure && !outcome.activation,
++                "spill failure was disguised as cancellation/publication");
++        require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
++                "failed spill released its owner");
++        require(!program.has_context_transaction() &&
++                    manager.lane_state(LaneId{0}) == ninfer::runtime::LogicalLaneState::Free,
++                "failed spill retained the transaction or destination lane");
++        RuntimeStats stats;
++        manager.populate_runtime_stats(program, stats);
++        require(stats.pressure_private_owners_evicted == 0 &&
++                    stats.pressure_private_owners_degraded == 0,
++                "failed spill counted an uncommitted mutation");
++        program.retryable_spill_failure = false;
++        program.required_pressure_actions = 0;
++        program.require_evictions = false;
++        const auto next = start_active(manager, program, 50, make_base(50), 3);
++        require(program.started_source_id == seed.sequence.id,
++                "next request could not reuse retained owner");
++        (void)finish_active(manager, program, next);
++        std::cout << "PASS retryable spill: retained owner, free lane, next request completed\n";
++    }
+     FakeManager manager = make_manager(1, 2);
+     FakeProgram program;
+     const ActiveRequest seed = start_active(manager, program, 5, make_base(5), 1);

@@ -151,8 +151,8 @@ DiskKVStore::DiskKVStore(Options opts) : opts_(std::move(opts)) {
     for (std::uint32_t s = 0; s < max_slots_; ++s) { free_slots_.push_back(s); }
 
     // Fast path: load the packed index (a full slot scan here costs minutes on
-    // virtiofs-mounted stores; all structural changes persist the index
-    // eagerly, so the rows are consistent). Data CRCs stay lazily verified at
+    // virtiofs-mounted stores; stale rows are checked against slot identities,
+    // including interrupted batches). Data CRCs stay lazily verified at
     // read time by design (a corrupted page becomes a restore miss). Without a
     // valid index file a full scan rebuilds it.
     if (!load_index()) {
@@ -196,6 +196,7 @@ bool DiskKVStore::load_index() {
     IdxHeader hdr{};
     if (std::fread(&hdr, sizeof(hdr), 1, f) != 1 ||
         hdr.magic != IdxHeader::kMagic ||
+        hdr.version != 1 || hdr.count > max_slots_ ||
         hdr.slot_size != static_cast<std::uint32_t>(slot_bytes()) ||
         hdr.max_slots != max_slots_) {
         std::fclose(f);
@@ -260,11 +261,13 @@ void DiskKVStore::rebuild_from_scan() {
         if (!live[s]) { free_slots_.push_back(s); }
     }
     rebuilt_from_scan_ = true;
+    index_dirty_ = true;
     persist_index_unlocked();
 }
 
 void DiskKVStore::persist_index_unlocked() {
-    // Atomic: write a tmp file, fsync, rename over the index path.
+    if (!index_dirty_) { return; }
+    // Atomic publication only: no fsync on the hot path.
     const std::string path = index_path(opts_.path);
     const std::string tmp  = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -276,9 +279,7 @@ void DiskKVStore::persist_index_unlocked() {
     hdr.slot_size = static_cast<std::uint32_t>(slot_bytes());
     hdr.max_slots = max_slots_;
     hdr.clock     = clock_;
-    std::fwrite(&hdr, sizeof(hdr), 1, f);
-    std::fseek(f, 0, SEEK_END);
-    const std::size_t total = (std::size_t)ftell(f) + index_.size() * sizeof(IdxEntry);
+    bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1;
     for (const auto& [id, s] : index_) {
         IdxEntry r{};
         r.lo = id.lo;
@@ -286,17 +287,18 @@ void DiskKVStore::persist_index_unlocked() {
         r.tag = id.tag;
         r.frontier = id.frontier;
         r.slot = s;
-        std::fwrite(&r, sizeof(r), 1, f);
+        if (std::fwrite(&r, sizeof(r), 1, f) != 1) { ok = false; break; }
     }
-    std::fflush(f);
-    std::fclose(f);
+    if (std::fflush(f) != 0) { ok = false; }
+    if (std::fclose(f) != 0) { ok = false; }
     // Deliberately NO fsync on the hot path: a torn index is recovered by a
     // full header rescan on next open (cheap: slots are CRC-verified), and
     // the spill worker would otherwise stall behind fsync latency per page.
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
         ::unlink(tmp.c_str());
         return;
     }
+    index_dirty_ = false;
 }
 
 // ---------- internals ----------
@@ -349,9 +351,11 @@ bool DiskKVStore::identity_matches(const Header& h, const DiskKVIdentity& id) co
 // ---------- API ----------
 
 std::uint32_t DiskKVStore::live_slots() const noexcept {
+    std::lock_guard<std::mutex> lock(mu_);
     return static_cast<std::uint32_t>(index_.size());
 }
 std::size_t DiskKVStore::used_bytes() const noexcept {
+    std::lock_guard<std::mutex> lock(mu_);
     return index_.size() * slot_pitch_;
 }
 std::size_t DiskKVStore::free_bytes() const noexcept {
@@ -367,6 +371,7 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
     if (it != index_.end()) {
         // Already restorable: refresh LRU in memory (flushed by flush_index).
         (*slot_hdr(it->second)).last_used = bump_clock();
+        index_dirty_ = true;
         return true;
     }
 
@@ -387,6 +392,8 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
     }
 
     // Write page bytes, then stamp the header LAST (magic makes it live).
+    // A free slot can retain an orphan header after a stale-index open.
+    zero_slot(slot);
     std::memcpy(base_ + page_off(slot), bytes.data(), opts_.slot_size);
     Header nh{};
     nh.magic     = Header::kMagic;
@@ -399,9 +406,9 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
     nh.last_used = bump_clock();
     std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
     record_live(id, slot, nh.last_used);
-    // Structural change (new live page / eviction): persist NOW so the page
-    // is discoverable across a crash. LRU-only changes are lazy.
-    persist_index_unlocked();
+    index_dirty_ = true;
+    // Preserve eager publication for direct users; batch workers opt in.
+    if (!opts_.defer_index_updates) { persist_index_unlocked(); }
     return true;
 }
 
@@ -421,6 +428,7 @@ bool DiskKVStore::read_page(const DiskKVIdentity& id, std::span<std::byte> dst) 
     std::memcpy(dst.data(), base_ + off, opts_.slot_size);
     // Read counts as use: refresh LRU in memory (lazy persist).
     (*slot_hdr(slot)).last_used = bump_clock();
+    index_dirty_ = true;
     return true;
 }
 
@@ -439,6 +447,7 @@ bool DiskKVStore::touch(const DiskKVIdentity& id) {
     const auto it = index_.find(id);
     if (it == index_.end()) { return false; }
     (*slot_hdr(it->second)).last_used = bump_clock();
+    index_dirty_ = true;
     return true;
 }
 
@@ -450,6 +459,7 @@ bool DiskKVStore::evict(const DiskKVIdentity& id) {
     index_.erase(it);
     zero_slot(slot);
     release_slot(slot);
+    index_dirty_ = true;
     persist_index_unlocked();
     return true;
 }
@@ -457,13 +467,16 @@ bool DiskKVStore::evict(const DiskKVIdentity& id) {
 std::vector<DiskKVIdentity> DiskKVStore::evict_until_free(std::uint32_t free) {
     std::lock_guard<std::mutex> lock(mu_);
     std::vector<DiskKVIdentity> gone;
-    while (index_.size() + free_slots_.size() < max_slots_ &&
-           free_slots_.size() < free) {
+    // live + free == capacity normally; requests above capacity saturate.
+    while (free_slots_.size() < free && !index_.empty()) {
         auto v = evict_one_lru();
         if (!v.has_value()) { break; }
         gone.push_back(v->id);
     }
-    if (!gone.empty()) { persist_index_unlocked(); }
+    if (!gone.empty()) {
+        index_dirty_ = true;
+        persist_index_unlocked();
+    }
     return gone;
 }
 

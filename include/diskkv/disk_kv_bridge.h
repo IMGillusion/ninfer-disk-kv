@@ -30,6 +30,7 @@
 #include "diskkv/disk_kv_store.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <condition_variable>
@@ -52,10 +53,19 @@ enum class DiskKVKind : std::uint8_t {
 
 /** One queued spill: identity + copied bytes. Engine copies; the bridge's
  *  worker thread does the disk write (off the engine's hot path). */
+// Completion acknowledges upsert/readability, NOT durable index publication.
+// Probe runs on the writer too, so dedupe never waits for the store lock on the engine.
+enum class SpillStatus : std::uint8_t { Pending, Present, Missing, Written, Failed };
+struct SpillCompletion { std::atomic<SpillStatus> status{SpillStatus::Pending}; };
+using SpillTicket = std::shared_ptr<SpillCompletion>;
+
 struct SpillJob {
     DiskKVIdentity id;
     DiskKVKind kind;
     std::vector<std::byte> bytes;
+    SpillTicket completion;
+    std::span<const std::byte> borrowed;
+    bool probe = false;
 };
 
 struct DiskKVBridgeStats {
@@ -113,6 +123,16 @@ public:
      *  true if restorable after the call (fresh write or dedupe hit). */
     bool spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
                          std::span<const std::byte> bytes);
+
+    // Null ticket = busy; retry without releasing the owner. No store lock.
+    // Borrowed bytes MUST remain immutable/alive until poll != Pending,
+    // including cancellation. Worker never accesses SequenceState.
+    SpillTicket try_probe(const DiskKVIdentity& id, DiskKVKind kind);
+    SpillTicket try_submit(const DiskKVIdentity& id, DiskKVKind kind,
+                           std::span<const std::byte> bytes);
+    static SpillStatus poll(const SpillTicket& ticket) noexcept {
+        return ticket->status.load(std::memory_order_acquire);
+    }
 
     /** Wait until all queued spill jobs have been applied. Test/diagnostics. */
     void wait_idle();

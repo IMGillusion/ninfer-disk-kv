@@ -48,6 +48,7 @@ DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
         sopts.capacity_bytes = budget;
         sopts.max_slots      = 0;  // derived from capacity_bytes
         sopts.verify_crc     = opts_.verify_crc;
+        sopts.defer_index_updates = true;
         f.store = std::make_unique<DiskKVStore>(sopts);
     };
     const std::size_t total = opts_.capacity_bytes;
@@ -101,17 +102,12 @@ void DiskKVBridge::wait_idle() {
         std::unique_lock<std::mutex> lock(qmu_);
         qcv_.wait(lock, [this] { return queue_.empty() && in_flight_ == 0; });
     }
-    // Durability barrier: land any batched index updates.
-    if (flush_pending_ != 0) {
-        flush_pending_ = 0;
-        for (Family& fam : families_) {
-            if (fam.store != nullptr) { fam.store->flush_index(); }
-        }
-    }
+    // Worker keeps in_flight nonzero through its idle flush.
 }
 
 void DiskKVBridge::worker_loop() {
     while (true) {
+        try {
         SpillJob job;
         bool have = false;
         {
@@ -130,16 +126,40 @@ void DiskKVBridge::worker_loop() {
             continue;
         }
         spill_queued(job);
-        std::lock_guard<std::mutex> lock(qmu_);
-        in_flight_ -= 1;
-        if (queue_.empty() && flush_pending_ != 0) {
+        bool flush = false;
+        {
+            std::unique_lock<std::mutex> lock(qmu_);
+            // Consecutive resumable tickets have scheduler gaps. Coalesce them;
+            // waiting releases qmu and never delays try_submit on the engine.
+            if (queue_.empty() && flush_pending_ != 0 && !quit_) {
+                qcv_.wait_for(lock, std::chrono::milliseconds(10),
+                              [this] { return quit_ || !queue_.empty(); });
+            }
+            flush = queue_.empty() && flush_pending_ != 0;
+        }
+        if (flush) {
             // The burst drained: land the batched index updates while idle.
             flush_pending_ = 0;
             for (Family& fam : families_) {
                 if (fam.store != nullptr) { fam.store->flush_index(); }
             }
         }
-        qcv_.notify_all();  // wait_idle may be waiting on the queue draining
+        {
+            std::lock_guard<std::mutex> lock(qmu_);
+            in_flight_ -= 1;
+        }
+        qcv_.notify_all();  // wait_idle includes flush; enqueue never holds a disk lock
+        } catch (const std::exception& e) {
+            // A worker-side I/O/allocation failure must never terminate the
+            // engine. Drop to the idle wait; the next job retries fresh.
+            std::lock_guard<std::mutex> lock(qmu_);
+            in_flight_ -= (in_flight_ > 0 ? 1 : 0);
+            qcv_.notify_all();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(qmu_);
+            in_flight_ -= (in_flight_ > 0 ? 1 : 0);
+            qcv_.notify_all();
+        }
     }
 }
 
@@ -161,7 +181,7 @@ bool DiskKVBridge::spill_page(const DiskKVIdentity& id, DiskKVKind kind,
         stats_.queue_drops += 1;
         return false;  // backpressure: page won't be restorable (recompute later)
     }
-    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}});
+    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}, {}, {}, false});
     qcv_.notify_all();
     return true;
 }
@@ -189,17 +209,27 @@ bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
         return false;
     }
     if (quit_) { return false; }
-    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}});
+    queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}, {}, {}, false});
     qcv_.notify_all();
     return true;
 }
 
 void DiskKVBridge::spill_queued(SpillJob& job) {
     Family& f = family(job.kind);
-    if (f.store == nullptr || job.bytes.size() != f.stride) { return; }
+    const auto finish = [&](SpillStatus status) {
+        if (job.completion) { job.completion->status.store(status, std::memory_order_release); }
+    };
+    try {
+    if (job.probe) {
+        const bool present = f.store && f.store->contains(job.id);
+        if (present) { std::lock_guard<std::mutex> lock(mu_); ++stats_.spill_dups; }
+        finish(present ? SpillStatus::Present : SpillStatus::Missing);
+        return;
+    }
+    const auto bytes = job.borrowed.empty() ? std::span<const std::byte>(job.bytes) : job.borrowed;
+    if (f.store == nullptr || bytes.size() != f.stride) { finish(SpillStatus::Failed); return; }
     std::vector<std::uint32_t> evicted;
-    std::span<const std::byte> bytes(job.bytes);
-    if (!f.store->upsert_page(job.id, bytes, &evicted)) { return; }
+    if (!f.store->upsert_page(job.id, bytes, &evicted)) { finish(SpillStatus::Failed); return; }
     // Batched index durability (see flush_pending_ in the header): a per-page
     // atomic index rewrite dominated large owner-death sweeps.
     if (++flush_pending_ >= 64) {
@@ -210,8 +240,31 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     }
     std::lock_guard<std::mutex> lock(mu_);
     stats_.spills += 1;
-    stats_.spill_bytes += job.bytes.size();
+    stats_.spill_bytes += bytes.size();
     stats_.evicted_slots += evicted.size();
+    finish(SpillStatus::Written);
+    } catch (...) { finish(SpillStatus::Failed); }
+}
+
+SpillTicket DiskKVBridge::try_probe(const DiskKVIdentity& id, DiskKVKind kind) {
+    std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
+    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
+    auto ticket = std::make_shared<SpillCompletion>();
+    SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.probe = true;
+    queue_.push_back(std::move(job));
+    qcv_.notify_one();
+    return ticket;
+}
+
+SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
+                                    std::span<const std::byte> bytes) {
+    std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
+    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
+    auto ticket = std::make_shared<SpillCompletion>();
+    SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.borrowed = bytes;
+    queue_.push_back(std::move(job));
+    qcv_.notify_one();
+    return ticket;
 }
 
 bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,

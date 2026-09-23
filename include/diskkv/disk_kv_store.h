@@ -16,7 +16,8 @@
 //     placement is managed by the store (free pool), NOT by a hash of the
 //     identity — identity->slot lives in the index.
 //   * INDEX file (<path>.idx): the identity->slot mapping, rewritten
-//     atomically (tmp + fsync + rename) whenever the live set changes.
+//     atomically (tmp + rename) whenever the live set changes by default.
+//     No power-loss durability guarantee (no fsync/msync).
 //   * Open: valid index -> fast path. Missing/corrupt index -> rebuild by
 //     scanning slot headers (slow, one-time; CRC-verified).
 //
@@ -68,6 +69,11 @@ public:
         std::size_t capacity_bytes = 0; // 0 = invalid (one of the two is required)
         std::uint32_t max_slots   = 0;  // explicit capacity (preferred)
         bool verify_crc          = true;
+        // Opt-in for workers calling flush_index() at batch/idle/shutdown.
+        // Defers new-page publication ONLY; explicit evictions stay eager.
+        // Crash/close before flush can lose new pages, never trust stale rows.
+        // Destructor does not flush; owner must flush before shutdown.
+        bool defer_index_updates = false;
     };
 
     /** Open the backing file and the identity index. Throws on I/O errors or
@@ -116,8 +122,8 @@ public:
     /** Slot indices currently live (diagnostics). */
     [[nodiscard]] std::vector<std::uint32_t> live_slot_list() const;
 
-    /** Public durability point (worker thread / tests): persist pending
-     *  in-memory LRU/index changes to the index file. */
+    /** Publish pending LRU/index changes (batch/idle/shutdown barrier).
+     *  Atomic replacement, NOT an fsync/power-loss durability barrier. */
     void flush_index();
 
     static constexpr std::size_t kSlotHeaderSize = 48;
@@ -190,6 +196,7 @@ private:
     std::uint32_t max_slots_ = 0;
     std::uint64_t clock_     = 0;
     bool         rebuilt_from_scan_ = false;
+    bool         index_dirty_ = false; // protected by mu_ after construction
 
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
     std::vector<std::uint32_t> free_slots_;
