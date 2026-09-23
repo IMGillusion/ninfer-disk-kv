@@ -66,7 +66,9 @@ int main(int argc, char** argv) {
         std::vector<std::byte> out(stride);
         CHECK(s.read_page(id, out) && std::memcmp(out.data(), page.data(), stride) == 0,
               "persisted bytes identical");
-        CHECK(!s.index_rebuilt_from_scan(), "fast index path (no scan)");
+        // The slot scan is now the authority on every open (a stale packed
+        // index silently produced contains()-ok / read-fail rows).
+        CHECK(s.index_rebuilt_from_scan(), "reopen rebuilds index from slot scan");
     }
 
     // ---------- 3. LRU eviction order ----------

@@ -14,10 +14,6 @@
 #include <stdexcept>
 #include <system_error>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <nmmintrin.h>  // _mm_crc32_u8/u64 (SSE4.2, hardware CRC32C)
-#endif
-
 namespace ninfer {
 namespace {
 
@@ -31,14 +27,25 @@ std::string index_path(const std::string& data_path) {
 }
 
 struct CrcTable {
-    std::array<std::uint32_t, 256> t{};
+    // Slicing-by-8 tables for the SAME polynomial as the original byte-wise
+    // table (0xEDB88320, the reflected CRC-32 / zlib polynomial) — values are
+    // bit-identical to the byte-wise implementation, so every page ever
+    // written stays valid. (The SSE4.2 _mm_crc32_* instruction computes the
+    // *Castagnoli* CRC32C and is NOT value-compatible with this format.)
+    std::array<std::array<std::uint32_t, 256>, 8> t{};
     CrcTable() {
         for (std::uint32_t i = 0; i < 256; ++i) {
             std::uint32_t c = i;
             for (int k = 0; k < 8; ++k) {
                 c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
             }
-            t[i] = c;
+            t[0][i] = c;
+        }
+        for (std::size_t s = 1; s < 8; ++s) {
+            for (std::uint32_t i = 0; i < 256; ++i) {
+                const std::uint32_t prev = t[s - 1][i];
+                t[s][i] = (prev >> 8) ^ t[0][prev & 0xFFu];
+            }
         }
     }
 };
@@ -47,52 +54,34 @@ const CrcTable& crc_table() {
     return tbl;
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((target("sse4.2")))
-#endif
-std::uint32_t crc32c_hw_run(std::uint32_t c, const std::byte* p, std::size_t n) noexcept {
-    std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, p + i, 8);
-        c = static_cast<std::uint32_t>(_mm_crc32_u64(c, v));
-    }
-    for (; i < n; ++i) {
-        c = _mm_crc32_u8(c, static_cast<std::uint8_t>(p[i]));
-    }
-    return c;
-}
-
-bool crc32c_hw_available() noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-    static const bool ok = (__builtin_cpu_supports("sse4.2") != 0);
-    return ok;
-#else
-    return true;  // MSVC x64: the intrinsic emits the instruction directly
-#endif
-}
-#endif
-
 } // namespace
 
 std::uint64_t DiskKVStore::crc32c(std::span<const std::byte> data) {
-    const std::byte* p = data.data();
-    const std::size_t n = data.size();
-#if defined(__x86_64__) || defined(_M_X64)
-    // Hardware CRC32C (SSE4.2) — same polynomial, ~20x the table speed. The
-    // table was the dominant cost of large spills/restores (~100 MB/s vs the
-    // NVMe's 3+ GB/s).
-    if (crc32c_hw_available()) {
-        return static_cast<std::uint64_t>(
-            crc32c_hw_run(0xFFFFFFFFu, p, n) ^ 0xFFFFFFFFu);
-    }
-#endif
     const auto& tbl = crc_table();
+    const std::byte* p = data.data();
+    std::size_t n = data.size();
     std::uint32_t c = 0xFFFFFFFFu;
-    for (const std::byte b : data) {
-        const std::uint8_t v = static_cast<std::uint8_t>(b);
-        c = tbl.t[(c ^ v) & 0xFFu] ^ (c >> 8);
+    // Slicing-by-8: identical values to the original byte-wise loop, ~8-16x
+    // faster (the byte-wise loop was the dominant cost of large sweeps).
+    auto le32 = [](const std::byte* q) {
+        return static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[0])) |
+               (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[1])) << 8) |
+               (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[2])) << 16) |
+               (static_cast<std::uint32_t>(static_cast<std::uint8_t>(q[3])) << 24);
+    };
+    while (n >= 8) {
+        c ^= le32(p);
+        const std::uint32_t next = le32(p + 4);
+        c = tbl.t[7][c & 0xFFu] ^ tbl.t[6][(c >> 8) & 0xFFu] ^ tbl.t[5][(c >> 16) & 0xFFu] ^
+            tbl.t[4][(c >> 24) & 0xFFu] ^ tbl.t[3][next & 0xFFu] ^
+            tbl.t[2][(next >> 8) & 0xFFu] ^ tbl.t[1][(next >> 16) & 0xFFu] ^
+            tbl.t[0][(next >> 24) & 0xFFu];
+        p += 8;
+        n -= 8;
+    }
+    for (; n > 0; --n, ++p) {
+        const std::uint8_t v = static_cast<std::uint8_t>(*p);
+        c = tbl.t[0][(c ^ v) & 0xFFu] ^ (c >> 8);
     }
     return static_cast<std::uint64_t>(c ^ 0xFFFFFFFFu);
 }
@@ -161,9 +150,15 @@ DiskKVStore::DiskKVStore(Options opts) : opts_(std::move(opts)) {
     }
     for (std::uint32_t s = 0; s < max_slots_; ++s) { free_slots_.push_back(s); }
 
-    if (!load_index()) {
-        rebuild_from_scan();
-    }
+    // The slot headers + data CRCs are the authority: always (re)derive the
+    // in-memory index from a full scan. The packed index is only a cache of
+    // that derivation and can be stale after a SIGKILL (LRU/eviction updates
+    // are lazily persisted), which previously produced index rows that passed
+    // `contains()` but failed the per-read header/CRC check and pushed the
+    // engine onto a slow full-replay fallback. A scan of a 40 GiB store costs
+    // a few seconds at the store's measured scan rate and removes that whole
+    // failure class.
+    rebuild_from_scan();
 }
 
 void DiskKVStore::create_fresh() {
