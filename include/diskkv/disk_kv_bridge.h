@@ -27,7 +27,7 @@
 // One family per KV plane: MainKV / BackendKV have different page strides,
 // so each owns its own store file.
 
-#include "diskkv/disk_kv_store.h"
+#include "core/disk_kv_store.h"
 
 #include <array>
 #include <atomic>

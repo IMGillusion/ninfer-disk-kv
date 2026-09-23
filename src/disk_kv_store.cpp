@@ -1,4 +1,4 @@
-#include "diskkv/disk_kv_store.h"
+#include "core/disk_kv_store.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
