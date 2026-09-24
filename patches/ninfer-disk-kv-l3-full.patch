@@ -100,10 +100,10 @@ index 98052fdb..70389777 100644
    core/layout.cpp
 diff --git a/src/core/disk_kv_bridge.cpp b/src/core/disk_kv_bridge.cpp
 new file mode 100644
-index 00000000..ed065dce
+index 00000000..920e9e33
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.cpp
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,416 @@
 +#include "core/disk_kv_bridge.h"
 +
 +#include <algorithm>
@@ -338,9 +338,27 @@ index 00000000..ed065dce
 +        return;
 +    }
 +    const auto bytes = job.borrowed.empty() ? std::span<const std::byte>(job.bytes) : job.borrowed;
-+    if (f.store == nullptr || bytes.size() != f.stride) { finish(SpillStatus::Failed); return; }
++    if (f.store == nullptr || bytes.size() != f.stride) {
++        if (f.store != nullptr) {
++            fprintf(stderr, "[l3-bridge] FAIL kind=%u stride mismatch: bytes=%zu family=%zu id=%llu/%llu/%llu\n",
++                    static_cast<unsigned>(job.kind), bytes.size(), f.stride,
++                    static_cast<unsigned long long>(job.id.lo),
++                    static_cast<unsigned long long>(job.id.hi),
++                    static_cast<unsigned long long>(job.id.tag));
++        }
++        finish(SpillStatus::Failed);
++        return;
++    }
 +    std::vector<std::uint32_t> evicted;
-+    if (!f.store->upsert_page(job.id, bytes, &evicted)) { finish(SpillStatus::Failed); return; }
++    if (!f.store->upsert_page(job.id, bytes, &evicted)) {
++        fprintf(stderr, "[l3-bridge] FAIL upsert=false kind=%u size=%zu id=%llu/%llu/%llu\n",
++                static_cast<unsigned>(job.kind), bytes.size(),
++                static_cast<unsigned long long>(job.id.lo),
++                static_cast<unsigned long long>(job.id.hi),
++                static_cast<unsigned long long>(job.id.tag));
++        finish(SpillStatus::Failed);
++        return;
++    }
 +    // Batched index durability (see flush_pending_ in the header): a per-page
 +    // atomic index rewrite dominated large owner-death sweeps.
 +    if (++flush_pending_ >= 64) {
@@ -2176,7 +2194,7 @@ index fcee5fc8..6f1ccfef 100644
      void commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                              std::uint32_t backend_tokens = 0);
 diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
-index e2a84d3d..adb24607 100644
+index e2a84d3d..177ef969 100644
 --- a/src/targets/qwen3_6/impl/runtime/program_impl.h
 +++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
 @@ -17,17 +17,27 @@
@@ -2274,7 +2292,7 @@ index e2a84d3d..adb24607 100644
      io = qwen3_6::RoundState(backing, plan.persistent.round);
      if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
          throw std::logic_error("round-state MTP extension does not match the sequence plan");
-@@ -2846,10 +2916,1051 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
+@@ -2846,10 +2916,1059 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
      } else if (speculative_backend == SpeculativeBackend::DFlash) {
          sequence.dflash_context_frontier = retained->backend_frontier;
      }
@@ -2688,6 +2706,14 @@ index e2a84d3d..adb24607 100644
 +                        // (Per-page pin+copy+event round trips ~6ms each made a
 +                        // cold 1.7k-page owner take ~10s.)
 +                        if (p.batch_ids.size() >= kL3ScratchPages) { return false; }
++                        // A batch must be single-kind: the flush submits every
++                        // id under batch_kind with batch_stride (the scratch
++                        // view matches that kind too). Without this guard a
++                        // stage switch (text -> backend chain) mid-batch would
++                        // submit main-KV ids against the backend family and
++                        // every one of them fails the store's stride check,
++                        // wedging the victim's whole materialization.
++                        if (!p.batch_ids.empty() && kind != p.batch_kind) { return false; }
 +                        if (!pages->can_pin_source(logical)) {
 +                            if (anchor_stage) { ++p.page; continue; }
 +                            return false;
@@ -3326,7 +3352,7 @@ index e2a84d3d..adb24607 100644
  qwen3_6::detail::PressureDecision
  ProgramImplCore::inspect_eviction_option(const SequenceState& sequence) const {
      qwen3_6::detail::PressureDecision option;
-@@ -4452,6 +5563,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+@@ -4452,6 +5571,45 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
          materialization_identity_.assign(prompt);
          materialization_prefix_digests_.assign(prompt);
  
@@ -3372,7 +3398,7 @@ index e2a84d3d..adb24607 100644
          const std::uint32_t initial_mtp_extent =
              speculative_backend == SpeculativeBackend::Mtp
                  ? std::min({draft_window,
-@@ -4465,8 +5615,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
+@@ -4465,8 +5623,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
              .vision_plan        = std::move(request_plan.vision),
              .vision             = nullptr,
              .capture_groups     = std::move(request_plan.capture_groups),
@@ -3389,7 +3415,7 @@ index e2a84d3d..adb24607 100644
              .prompt_tokens      = prompt_tokens,
              .initial_mtp_extent = initial_mtp_extent,
              .elapsed_seconds    = 0.0,
-@@ -5807,6 +6963,7 @@ void ProgramImplCore::publish_pressure_work(
+@@ -5807,6 +6971,7 @@ void ProgramImplCore::publish_pressure_work(
  
  void ProgramImplCore::abort_pressure_work(MaterializationTransaction::PressureWork& work) noexcept {
      try {
@@ -3397,7 +3423,7 @@ index e2a84d3d..adb24607 100644
          if (work.completed) { return; }
          for (auto& change : work.state_changes) {
              if (change.transfer) {
-@@ -5842,7 +6999,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
+@@ -5842,7 +7007,7 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
      }
  
      out.delta.removed = resident_resources(continuation_states[index]);
@@ -3406,7 +3432,7 @@ index e2a84d3d..adb24607 100644
      if (transaction.root_waiting_for_victim && transaction.root_continuation_index == index) {
          continuation_slots[index].role      = ContinuationSlotRole::ReservedMaterialization;
          transaction.root_waiting_for_victim = false;
-@@ -5980,11 +7137,20 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
+@@ -5980,11 +7145,20 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
  
      if (pressure_transition.phase == PressureTransitionPhase::HostReleases) {
          if (transaction.cancel_pending) {
@@ -3428,7 +3454,7 @@ index e2a84d3d..adb24607 100644
              if (work.option.evicts_continuation) {
                  const std::uint32_t index      = transaction.shared_victim_indices[position];
                  const std::uint64_t generation = transaction.shared_victim_generations[position];
-@@ -6020,9 +7186,73 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
+@@ -6020,9 +7194,73 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                  publish_pressure_host_releases(work);
              }
          }
@@ -3503,7 +3529,7 @@ index e2a84d3d..adb24607 100644
                  const PhysicalReleaseResult released =
                      release_materialization_victim(transaction, position);
                  if (released.status != runtime::ConsumeStatus::Consumed ||
-@@ -6240,7 +7470,25 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
+@@ -6240,7 +7478,25 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
      }
  
      if (!transaction.source_prepared) {
@@ -3530,7 +3556,7 @@ index e2a84d3d..adb24607 100644
          if (cancellation.requested()) { transaction.cancel_pending = true; }
          if (transaction.cancel_pending) {
              abort_transaction();
-@@ -6312,7 +7560,8 @@ ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView canc
+@@ -6312,7 +7568,8 @@ ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView canc
              return runtime::ContextTransactionInProgress{};
          }
          if (result.status != runtime::ContextTransactionStatus::Published &&
@@ -3540,7 +3566,7 @@ index e2a84d3d..adb24607 100644
              throw std::logic_error("context transaction returned an invalid status");
          }
          return ContextTransactionProgress<Variant>(std::forward<Result>(result));
-@@ -6546,12 +7795,12 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index)
+@@ -6546,12 +7803,12 @@ bool ProgramImplCore::can_release_continuation_slot_strict(std::uint32_t index)
      return true;
  }
  
@@ -3555,7 +3581,7 @@ index e2a84d3d..adb24607 100644
      release_sequence_state_strict(sequence);
      retire_continuation_slot(index);
  }
-@@ -7074,6 +8323,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
+@@ -7074,6 +8331,7 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
      out.processed_prompt_tokens = step.processed_prompt_tokens;
      out.complete                = step.complete;
      out.timing                  = step.timing;
@@ -3563,7 +3589,7 @@ index e2a84d3d..adb24607 100644
      if (step.complete) {
          const std::array<std::uint32_t, 1> lanes{lane};
          const runtime::BatchedGeneratedRound round{
-@@ -9905,7 +11155,47 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
+@@ -9905,7 +11163,47 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
              : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                  : 0U;
          materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
@@ -3611,7 +3637,7 @@ index e2a84d3d..adb24607 100644
          sequence.rope_delta = staged.prompt.rope_delta;
          set_device_i32(io.rope_delta, sequence.rope_delta);
  
-@@ -10843,10 +12133,11 @@ void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence)
+@@ -10843,10 +12141,11 @@ void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence)
      if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
  }
  
@@ -3624,7 +3650,7 @@ index e2a84d3d..adb24607 100644
      if (sequence.kv->backend &&
          (!backend_kv_addresses || !backend_kv_addresses->can_release(*sequence.kv->backend))) {
          std::terminate();
-@@ -10861,6 +12152,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
+@@ -10861,6 +12160,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
  
  void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
      if (!sequence.kv) { return; }
@@ -3632,7 +3658,7 @@ index e2a84d3d..adb24607 100644
      unbind_sequence_kv(sequence);
      if (sequence.kv->backend && backend_kv_addresses) {
          (void)backend_kv_addresses->release(*sequence.kv->backend);
-@@ -11388,6 +12680,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
+@@ -11388,6 +12688,46 @@ void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens)
      }
  }
  
@@ -3679,7 +3705,7 @@ index e2a84d3d..adb24607 100644
  runtime::PrefillStepResult
  ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& request,
                                   runtime::ExecutionTiming* failed_timing) {
-@@ -11400,10 +12732,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11400,10 +12740,28 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
      if (staged.pending_capture_offer != 0) {
          throw std::logic_error("prefill cannot advance while a capture offer is pending");
      }
@@ -3711,7 +3737,7 @@ index e2a84d3d..adb24607 100644
      const auto started                    = Clock::now();
      try {
          if (staged.next_capture < staged.capture_groups.size() &&
-@@ -11428,10 +12778,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11428,10 +12786,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
              rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
              rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
          }
@@ -3732,7 +3758,7 @@ index e2a84d3d..adb24607 100644
              text_kv_view(sequence),
              mtp_kv_view(sequence),
              decoder->text_kv,
-@@ -11559,7 +12918,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11559,7 +12926,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                          staged.pending_capture_offer = next_capture_offer_id_;
                          return runtime::PrefillStepResult{
                              .summary                 = summary,
@@ -3741,7 +3767,7 @@ index e2a84d3d..adb24607 100644
                              .timing                  = timing.finish(),
                          };
                      }
-@@ -11577,7 +12936,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11577,7 +12944,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                      std::chrono::duration<double>(Clock::now() - started).count();
                  return runtime::PrefillStepResult{
                      .summary                 = summary,
@@ -3750,7 +3776,7 @@ index e2a84d3d..adb24607 100644
                      .timing                  = timing.finish(),
                  };
              }
-@@ -11624,6 +12983,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11624,6 +12991,11 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          timing.begin_wait();
          device.synchronize();
          timing.end_wait();
@@ -3762,7 +3788,7 @@ index e2a84d3d..adb24607 100644
          staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
          const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
          const std::uint32_t prompt_tokens = staged.prompt_tokens;
-@@ -11653,7 +13017,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11653,7 +13025,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
          staged.prompt.release_all_media_payloads();
          if (staged.vision) { staged.vision->retire_handoff(); }
@@ -3770,7 +3796,7 @@ index e2a84d3d..adb24607 100644
          const bool prompt_frontier_capture =
              staged.next_capture < staged.capture_groups.size() &&
              staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-@@ -11667,9 +13030,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
+@@ -11667,9 +13038,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
          return runtime::PrefillStepResult{
              .summary = summary,
              .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},

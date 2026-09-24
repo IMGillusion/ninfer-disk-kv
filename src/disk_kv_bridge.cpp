@@ -232,9 +232,27 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
         return;
     }
     const auto bytes = job.borrowed.empty() ? std::span<const std::byte>(job.bytes) : job.borrowed;
-    if (f.store == nullptr || bytes.size() != f.stride) { finish(SpillStatus::Failed); return; }
+    if (f.store == nullptr || bytes.size() != f.stride) {
+        if (f.store != nullptr) {
+            fprintf(stderr, "[l3-bridge] FAIL kind=%u stride mismatch: bytes=%zu family=%zu id=%llu/%llu/%llu\n",
+                    static_cast<unsigned>(job.kind), bytes.size(), f.stride,
+                    static_cast<unsigned long long>(job.id.lo),
+                    static_cast<unsigned long long>(job.id.hi),
+                    static_cast<unsigned long long>(job.id.tag));
+        }
+        finish(SpillStatus::Failed);
+        return;
+    }
     std::vector<std::uint32_t> evicted;
-    if (!f.store->upsert_page(job.id, bytes, &evicted)) { finish(SpillStatus::Failed); return; }
+    if (!f.store->upsert_page(job.id, bytes, &evicted)) {
+        fprintf(stderr, "[l3-bridge] FAIL upsert=false kind=%u size=%zu id=%llu/%llu/%llu\n",
+                static_cast<unsigned>(job.kind), bytes.size(),
+                static_cast<unsigned long long>(job.id.lo),
+                static_cast<unsigned long long>(job.id.hi),
+                static_cast<unsigned long long>(job.id.tag));
+        finish(SpillStatus::Failed);
+        return;
+    }
     // Batched index durability (see flush_pending_ in the header): a per-page
     // atomic index rewrite dominated large owner-death sweeps.
     if (++flush_pending_ >= 64) {
