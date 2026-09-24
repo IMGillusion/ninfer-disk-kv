@@ -100,10 +100,10 @@ index 98052fdb..70389777 100644
    core/layout.cpp
 diff --git a/src/core/disk_kv_bridge.cpp b/src/core/disk_kv_bridge.cpp
 new file mode 100644
-index 00000000..0839c099
+index 00000000..ed065dce
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.cpp
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,398 @@
 +#include "core/disk_kv_bridge.h"
 +
 +#include <algorithm>
@@ -174,7 +174,10 @@ index 00000000..0839c099
 +    if (!enabled_) {
 +        throw std::invalid_argument("disk kv bridge budget too small for one main page");
 +    }
-+    worker_ = std::thread([this] { worker_loop(); });
++    workers_.reserve(kWorkerCount);
++    for (std::size_t i = 0; i < kWorkerCount; ++i) {
++        workers_.emplace_back([this] { worker_loop(); });
++    }
 +}
 +
 +DiskKVBridge::~DiskKVBridge() {
@@ -183,7 +186,9 @@ index 00000000..0839c099
 +        quit_ = true;
 +    }
 +    qcv_.notify_all();
-+    if (worker_.joinable()) { worker_.join(); }
++    for (std::thread& w : workers_) {
++        if (w.joinable()) { w.join(); }
++    }
 +    // Drain whatever the worker already pulled off the queue so no page is
 +    // lost between join and destruction (best effort; store is still alive).
 +    while (true) {
@@ -499,10 +504,10 @@ index 00000000..0839c099
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_bridge.h b/src/core/disk_kv_bridge.h
 new file mode 100644
-index 00000000..06d627d6
+index 00000000..45b34aab
 --- /dev/null
 +++ b/src/core/disk_kv_bridge.h
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,223 @@
 +#pragma once
 +// Engine-facing facade over DiskKVStore (the L3 disk cold tier).
 +//
@@ -714,19 +719,24 @@ index 00000000..06d627d6
 +    std::mutex qmu_;
 +    std::condition_variable qcv_;
 +    std::deque<SpillJob> queue_;
-+    std::thread worker_;
++    std::vector<std::thread> workers_;
 +    bool quit_ = false;
 +    std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied
 +    static constexpr std::size_t kQueueCap = 512;  // ~780 MiB in flight at 1.5 MiB/page
++    // Parallel writers: the store's unlocked data section lets N writers copy
++    // pages concurrently; the SSD needs several in-flight streams to reach its
++    // bandwidth (single-writer was ~180 MB/s of a ~2 GB/s device through the
++    // bind-mount layer). Bookkeeping stays serialized by the store lock.
++    static constexpr std::size_t kWorkerCount = 3;
 +};
 +
 +} // namespace ninfer
 diff --git a/src/core/disk_kv_store.cpp b/src/core/disk_kv_store.cpp
 new file mode 100644
-index 00000000..07becfe1
+index 00000000..5ec2c3bd
 --- /dev/null
 +++ b/src/core/disk_kv_store.cpp
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,521 @@
 +#include "core/disk_kv_store.h"
 +
 +#include <fcntl.h>
@@ -1094,50 +1104,72 @@ index 00000000..07becfe1
 +bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
 +                             std::vector<std::uint32_t>* evicted) {
 +    if (bytes.size() != opts_.slot_size || max_slots_ == 0) { return false; }
-+    std::lock_guard<std::mutex> lock(mu_);
-+
-+    const auto it = index_.find(id);
-+    if (it != index_.end()) {
-+        // Already restorable: refresh LRU in memory (flushed by flush_index).
-+        (*slot_hdr(it->second)).last_used = bump_clock();
-+        index_dirty_ = true;
-+        return true;
-+    }
-+
 +    std::uint32_t slot = 0;
-+    if (!free_slots_.empty()) {
-+        slot = free_slots_.back();
-+        free_slots_.pop_back();
-+    } else {
-+        // Full: LRU-evict the coldest page.
-+        auto victim = evict_one_lru();
-+        if (!victim.has_value()) { return false; }
-+        if (evicted != nullptr) {
-+            evicted->push_back(victim->slot);
++    std::uint64_t stamp = 0;
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++
++        const auto it = index_.find(id);
++        if (it != index_.end()) {
++            // Already restorable: refresh LRU in memory (flushed by flush_index).
++            (*slot_hdr(it->second)).last_used = bump_clock();
++            index_dirty_ = true;
++            return true;
 +        }
-+        // evict_one_lru() already released the victim slot into free_slots_.
-+        slot = free_slots_.back();
-+        free_slots_.pop_back();
++
++        if (!free_slots_.empty()) {
++            slot = free_slots_.back();
++            free_slots_.pop_back();
++        } else {
++            // Full: LRU-evict the coldest page.
++            auto victim = evict_one_lru();
++            if (!victim.has_value()) { return false; }
++            if (evicted != nullptr) {
++                evicted->push_back(victim->slot);
++            }
++            // evict_one_lru() already released the victim slot into free_slots_.
++            slot = free_slots_.back();
++            free_slots_.pop_back();
++        }
++        stamp = bump_clock();
++        // Clear the previous (now orphaned) header before the unlocked write:
++        // a stale magic must never validate against half-written data.
++        zero_slot(slot);
 +    }
 +
-+    // Write page bytes, then stamp the header LAST (magic makes it live).
-+    // A free slot can retain an orphan header after a stale-index open.
-+    zero_slot(slot);
++    // ---- Unlocked region: the slot is off free_slots_ and absent from
++    // index_, so no reader, probe or LRU evictor can observe or reclaim it.
++    // The header is stamped last (under the lock) so the page becomes
++    // reachable only once its data and CRC are complete. Parallel writers
++    // therefore only contend on the short bookkeeping sections.
++    const std::uint32_t crc =
++        static_cast<std::uint32_t>(crc32c(std::span<const std::byte>(bytes.data(),
++                                                                    opts_.slot_size)));
 +    std::memcpy(base_ + page_off(slot), bytes.data(), opts_.slot_size);
-+    Header nh{};
-+    nh.magic     = Header::kMagic;
-+    nh.lo        = id.lo;
-+    nh.hi        = id.hi;
-+    nh.tag       = id.tag;
-+    nh.frontier  = id.frontier;
-+    nh.crc       = static_cast<std::uint32_t>(crc32c(
-+                       std::span<const std::byte>(base_ + page_off(slot), opts_.slot_size)));
-+    nh.last_used = bump_clock();
-+    std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
-+    record_live(id, slot, nh.last_used);
-+    index_dirty_ = true;
-+    // Preserve eager publication for direct users; batch workers opt in.
-+    if (!opts_.defer_index_updates) { persist_index_unlocked(); }
++
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (index_.find(id) != index_.end()) {
++            // Lost a race with another writer of the same id (both passed the
++            // pre-check): the id is written; return our slot instead of
++            // leaking it or double-linking.
++            free_slots_.push_back(slot);
++            return true;
++        }
++        Header nh{};
++        nh.magic     = Header::kMagic;
++        nh.lo        = id.lo;
++        nh.hi        = id.hi;
++        nh.tag       = id.tag;
++        nh.frontier  = id.frontier;
++        nh.crc       = crc;
++        nh.last_used = stamp;
++        std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
++        record_live(id, slot, nh.last_used);
++        index_dirty_ = true;
++        // Preserve eager publication for direct users; batch workers opt in.
++        if (!opts_.defer_index_updates) { persist_index_unlocked(); }
++    }
 +    return true;
 +}
 +

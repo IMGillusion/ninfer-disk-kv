@@ -365,50 +365,72 @@ std::size_t DiskKVStore::free_bytes() const noexcept {
 bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byte> bytes,
                              std::vector<std::uint32_t>* evicted) {
     if (bytes.size() != opts_.slot_size || max_slots_ == 0) { return false; }
-    std::lock_guard<std::mutex> lock(mu_);
-
-    const auto it = index_.find(id);
-    if (it != index_.end()) {
-        // Already restorable: refresh LRU in memory (flushed by flush_index).
-        (*slot_hdr(it->second)).last_used = bump_clock();
-        index_dirty_ = true;
-        return true;
-    }
-
     std::uint32_t slot = 0;
-    if (!free_slots_.empty()) {
-        slot = free_slots_.back();
-        free_slots_.pop_back();
-    } else {
-        // Full: LRU-evict the coldest page.
-        auto victim = evict_one_lru();
-        if (!victim.has_value()) { return false; }
-        if (evicted != nullptr) {
-            evicted->push_back(victim->slot);
+    std::uint64_t stamp = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+
+        const auto it = index_.find(id);
+        if (it != index_.end()) {
+            // Already restorable: refresh LRU in memory (flushed by flush_index).
+            (*slot_hdr(it->second)).last_used = bump_clock();
+            index_dirty_ = true;
+            return true;
         }
-        // evict_one_lru() already released the victim slot into free_slots_.
-        slot = free_slots_.back();
-        free_slots_.pop_back();
+
+        if (!free_slots_.empty()) {
+            slot = free_slots_.back();
+            free_slots_.pop_back();
+        } else {
+            // Full: LRU-evict the coldest page.
+            auto victim = evict_one_lru();
+            if (!victim.has_value()) { return false; }
+            if (evicted != nullptr) {
+                evicted->push_back(victim->slot);
+            }
+            // evict_one_lru() already released the victim slot into free_slots_.
+            slot = free_slots_.back();
+            free_slots_.pop_back();
+        }
+        stamp = bump_clock();
+        // Clear the previous (now orphaned) header before the unlocked write:
+        // a stale magic must never validate against half-written data.
+        zero_slot(slot);
     }
 
-    // Write page bytes, then stamp the header LAST (magic makes it live).
-    // A free slot can retain an orphan header after a stale-index open.
-    zero_slot(slot);
+    // ---- Unlocked region: the slot is off free_slots_ and absent from
+    // index_, so no reader, probe or LRU evictor can observe or reclaim it.
+    // The header is stamped last (under the lock) so the page becomes
+    // reachable only once its data and CRC are complete. Parallel writers
+    // therefore only contend on the short bookkeeping sections.
+    const std::uint32_t crc =
+        static_cast<std::uint32_t>(crc32c(std::span<const std::byte>(bytes.data(),
+                                                                    opts_.slot_size)));
     std::memcpy(base_ + page_off(slot), bytes.data(), opts_.slot_size);
-    Header nh{};
-    nh.magic     = Header::kMagic;
-    nh.lo        = id.lo;
-    nh.hi        = id.hi;
-    nh.tag       = id.tag;
-    nh.frontier  = id.frontier;
-    nh.crc       = static_cast<std::uint32_t>(crc32c(
-                       std::span<const std::byte>(base_ + page_off(slot), opts_.slot_size)));
-    nh.last_used = bump_clock();
-    std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
-    record_live(id, slot, nh.last_used);
-    index_dirty_ = true;
-    // Preserve eager publication for direct users; batch workers opt in.
-    if (!opts_.defer_index_updates) { persist_index_unlocked(); }
+
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (index_.find(id) != index_.end()) {
+            // Lost a race with another writer of the same id (both passed the
+            // pre-check): the id is written; return our slot instead of
+            // leaking it or double-linking.
+            free_slots_.push_back(slot);
+            return true;
+        }
+        Header nh{};
+        nh.magic     = Header::kMagic;
+        nh.lo        = id.lo;
+        nh.hi        = id.hi;
+        nh.tag       = id.tag;
+        nh.frontier  = id.frontier;
+        nh.crc       = crc;
+        nh.last_used = stamp;
+        std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
+        record_live(id, slot, nh.last_used);
+        index_dirty_ = true;
+        // Preserve eager publication for direct users; batch workers opt in.
+        if (!opts_.defer_index_updates) { persist_index_unlocked(); }
+    }
     return true;
 }
 

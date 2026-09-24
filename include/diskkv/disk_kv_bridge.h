@@ -209,10 +209,15 @@ private:
     std::mutex qmu_;
     std::condition_variable qcv_;
     std::deque<SpillJob> queue_;
-    std::thread worker_;
+    std::vector<std::thread> workers_;
     bool quit_ = false;
     std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied
     static constexpr std::size_t kQueueCap = 512;  // ~780 MiB in flight at 1.5 MiB/page
+    // Parallel writers: the store's unlocked data section lets N writers copy
+    // pages concurrently; the SSD needs several in-flight streams to reach its
+    // bandwidth (single-writer was ~180 MB/s of a ~2 GB/s device through the
+    // bind-mount layer). Bookkeeping stays serialized by the store lock.
+    static constexpr std::size_t kWorkerCount = 3;
 };
 
 } // namespace ninfer

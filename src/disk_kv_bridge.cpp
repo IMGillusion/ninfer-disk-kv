@@ -68,7 +68,10 @@ DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
     if (!enabled_) {
         throw std::invalid_argument("disk kv bridge budget too small for one main page");
     }
-    worker_ = std::thread([this] { worker_loop(); });
+    workers_.reserve(kWorkerCount);
+    for (std::size_t i = 0; i < kWorkerCount; ++i) {
+        workers_.emplace_back([this] { worker_loop(); });
+    }
 }
 
 DiskKVBridge::~DiskKVBridge() {
@@ -77,7 +80,9 @@ DiskKVBridge::~DiskKVBridge() {
         quit_ = true;
     }
     qcv_.notify_all();
-    if (worker_.joinable()) { worker_.join(); }
+    for (std::thread& w : workers_) {
+        if (w.joinable()) { w.join(); }
+    }
     // Drain whatever the worker already pulled off the queue so no page is
     // lost between join and destruction (best effort; store is still alive).
     while (true) {
