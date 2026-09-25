@@ -1,0 +1,313 @@
+# Seed: batched KV restore reads + one visit per batch pipeline
+# Baseline: the author's L3 work tree (proactive-evict), NOT upstream.
+# Series context: the full L3 disk tier lives in the ninfer-disk-kv repo;
+# these two patches are the reviewable delta measured in
+# kvcache_test/L3_STEP1_PIPELINE.md (restore 11-13s -> 4.6s for 93K tokens).
+# Changed lines: 204
+--- a/src/targets/qwen3_6/impl/runtime/program.h
++++ b/src/targets/qwen3_6/impl/runtime/program.h
+@@ -30,6 +30,7 @@
+ #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdint>
+ #include <array>
+ #include <limits>
+@@ -1015,7 +1016,33 @@
+         std::optional<RequestControl::Prefill> staged_prefill;
+         struct SeedProgress {
+             // Scheduler-only state; accepted CPU reads retain the startup scratch.
+-            ReadTicket read;
++            ReadTicket read;                 // state read, or the AGGREGATE of the KV batch
++            // KV pages read in flight, one ticket each. Submitting a whole
++            // scratch-full per visit (instead of one page) is what keeps a restore
++            // faster than recomputing it: one page per scheduler visit throttled a
++            // 93K-token restore to ~1461 visits (~52s) against ~19s of prefill.
++            // The aggregate in `read` only turns terminal once every part does, so
++            // the single-ticket cancellation contract stays intact - but ONLY if
++            // poll_seed_batch() runs before anything polls `read`.
++            std::vector<ReadTicket> batch;
++            std::vector<DeviceKVPageHandle> batch_destinations;
++            std::uint32_t batch_pages = 0;
++            // A batch stays open while it is being topped up to a full scratch: the
++            // shared bridge queue usually cannot accept all 128 reads at once, and
++            // closing short batches there measured ~700MB/s instead of the path's
++            // ~2.3GB/s. Nothing is polled until the batch is closed (full, family
++            // exhausted, or `topup_visits` reached the give-up bound).
++            bool batch_open = false;
++            std::uint32_t topup_visits = 0;
++            // Restore instrumentation: the request path must show whether the disk
++            // hit actually beat recomputing the same prompt.
++            std::chrono::steady_clock::time_point started{};
++            std::uint64_t batches = 0;
++            std::uint32_t max_batch = 0;
++            std::uint32_t pages_read = 0;
++            // Name every refusal site: an unattributed "no restore" costs a rebuild
++            // cycle per hypothesis.
++            const char* reason = "";
+             StateScratchLease::Lease state_scratch_lease;
+             std::uint32_t phase = 0; // state read, main pages, backend pages, state H2D, commit
+             std::uint32_t page = 0;
+@@ -1145,6 +1172,11 @@
+     void finalize_sequence(std::uint32_t lane, SequenceState& sequence,
+                            MaterializationTransaction& transaction);
+     bool progress_disk_seed(SequenceState& sequence, MaterializationTransaction& transaction);
++    // Aggregate the KV batch's part tickets into the single ticket the rest of the
++    // seed contract polls. MUST run before ANY poll of transaction.seed.read: the
++    // aggregate is only advanced here, so a cancellation that polls the aggregate
++    // without this would never observe completion and would hang the transaction.
++    void poll_seed_batch(MaterializationTransaction::SeedProgress& progress) noexcept;
+     void start_sequence(std::uint32_t lane, SequenceState& sequence,
+                         MaterializationTransaction& transaction);
+     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
+--- a/src/targets/qwen3_6/impl/runtime/program_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
+@@ -37,7 +37,15 @@
+ // The scratch is reserved once at startup (this many pages per KV family
+ // plus one host state slot) so the restore seed never allocates from the
+ // shared pools and pool pressure can neither fail nor block a restore.
+-constexpr std::uint32_t kL3ScratchPages = 32;
++// Batch cap for both the resumable owner spill and the disk seed's KV reads, and
++// the size of each L3 scratch reservation. It is a SCHEDULER-VISIT budget, not an
++// I/O budget: the engine thread spends ~30-60ms per scheduling step under load,
++// so a restore's wall time is dominated by how many visits it needs, not by the
++// store. Measured: 32 pages/batch -> 5164 pages cost ~162 batches x ~2 visits x
++// ~45ms = ~14s against a 2.6s I/O floor (the disk path sustains 2.3GB/s at eight
++// readers). 128 pages buys ~4x fewer visits for ~151MB of pinned host memory per
++// family (main + backend reserves), which is ~5% of the 6GiB host arena.
++constexpr std::uint32_t kL3ScratchPages = 128;
+ 
+ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
+     if (!options.max_private_continuations || *options.max_private_continuations == 0) {
+@@ -3226,7 +3234,7 @@
+             // Main/backend, host/device, and final partial chain pages share a
+             // probe, but never cross the stage boundary into tails or state.
+             for (std::uint32_t page = p.page;
+-                 page < count && p.batch_ids.size() < kL3ScratchPages; ++page) {
++                 page < count && p.batch_ids.size() < kDiskKVProbeBatchMax; ++page) {
+                 if (!addresses || !pages || !runtime_support::owner_spill_page_mapped(
+                         page, addresses->mapped_pages(address))) {
+                     p.failed = true; return false;
+@@ -3680,15 +3688,36 @@
+     }
+     }
+ 
++void ProgramImplCore::poll_seed_batch(MaterializationTransaction::SeedProgress& progress) noexcept {
++    if (progress.batch.empty()) { return; }
++    auto aggregate = DiskReadResult::Success;
++    for (const auto& ticket : progress.batch) {
++        const auto result = DiskKVBridge::poll(ticket);
++        if (result == DiskReadResult::Pending) { return; }   // aggregate stays Pending
++        if (result != DiskReadResult::Success) { aggregate = result; }
++    }
++    if (progress.read) { progress.read->result.store(aggregate, std::memory_order_release); }
++    progress.batch.clear();
++}
++
+ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
+                                          MaterializationTransaction& transaction) {
+     auto& progress = transaction.seed;
+     auto& staged = *transaction.staged_prefill;
+     if (progress.done) { return true; }
++    // NOTE: a wall-clock budget on the restore was tried and REVERTED. Aborting a
++    // restore mid-flight changes the transaction's result in a way the manager's
++    // planned actions do not expect, and production hit
++    // `materialization result is not action aligned` -> engine fail-all. With the
++    // store on a VM-internal disk (2.9GB/s cold, 7-8GB/s cached) a 3.4GB chain
++    // restores in ~1.2s, so the slow-cold-read case this guarded no longer exists.
++    if (progress.started.time_since_epoch().count() == 0) { progress.started = std::chrono::steady_clock::now(); }
++    poll_seed_batch(progress);
+     const auto fail = [&]() {
+         progress.failing = true;
+         // An accepted CPU borrow is irrevocable. Do not release the lease or
+         // owner on an exception until its terminal acquire acknowledgement.
++        poll_seed_batch(progress);
+         if (progress.read && DiskKVBridge::poll(progress.read) == DiskReadResult::Pending) {
+             return false;
+         }
+@@ -3716,8 +3745,10 @@
+         progress.done = true;
+         progress.state_scratch_lease.reset();
+         staged.advertised_base = 0;
+-        fprintf(stderr, "[l3-seed-yield] lane=%u phase=%u page=%u -> honest full recompute\n",
+-                sequence.lane, progress.phase, progress.page);
++        fprintf(stderr, "[l3-seed-yield] lane=%u phase=%u page=%u reason=%s elapsed_ms=%lld -> honest full recompute\n",
++                sequence.lane, progress.phase, progress.page, progress.reason,
++                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now()-progress.started).count()));
+         return true;
+     };
+     if (progress.failing) { return fail(); }
+@@ -3742,7 +3773,7 @@
+     };
+     const auto read = [&](const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst) {
+         NINFER_SEED_STAGE("read_submit");
+-        progress.read = disk_kv->try_read(id, kind, dst);
++        progress.read = disk_kv->try_read_priority(id, kind, dst);
+         NINFER_SEED_STAGE("read_accepted");
+     };
+     // Each invocation submits or polls ONE CPU read. No store locks on the
+@@ -3782,30 +3813,104 @@
+         auto* addresses = backend ? backend_kv_addresses.get() : text_kv_addresses.get();
+         auto& scratch = backend ? l3_backend_scratch : l3_kv_scratch;
+         if (!pages || !addresses || !scratch || (backend && !sequence.kv->backend)) {
++            progress.reason = "kv-scratch-missing";
+             return fail();
+         }
+         const auto address = backend ? *sequence.kv->backend : sequence.kv->text;
+         const auto* layout = host_kv_arena->layout_for(pages->physical_pool().geometry());
+-        if (!layout || progress.page >= addresses->mapped_pages(address)) { return fail(); }
+-        if (!progress.read) {
+-            const auto F = std::min((progress.page+1U)*std::uint32_t(kPagedKVPageSize), frontier);
+-            read(identity(F),
+-                backend ? DiskKVKind::BackendKV : DiskKVKind::MainKV,
+-                {host_kv_arena->writable_view(*scratch).data(), layout->page_stride});
+-            return false;
+-        }
+-        const auto result = DiskKVBridge::poll(progress.read);
++        if (!layout || progress.page >= addresses->mapped_pages(address)) { progress.reason = "mapping"; return fail(); }
++        // Read a whole scratch-full of pages per visit and copy them back with ONE
++        // H2D. One page per visit throttled the restore to the scheduler cadence
++        // (~1461 visits, ~52s for a 93K-token prompt) - slower than recomputing it.
++        //
++        // The submit of the NEXT batch happens at the end of this visit, right
++        // after the copy is issued and synchronized, instead of after a trip back
++        // to the scheduler. Without that, each batch's store reads only start one
++        // scheduling step (~30-60ms under load) after the previous batch drained,
++        // which halved the achievable rate: 5164 pages measured 7.4s against a
++        // ~2.6s I/O floor. The copy itself costs ~6ms for a full batch, so doing it
++        // inline is cheaper than the bubble it removes, and no second buffer or
++        // event is needed because the sync already protects the scratch.
++        const auto total = kv_pages_for_frontier(frontier);
++        const auto kind = backend ? DiskKVKind::BackendKV : DiskKVKind::MainKV;
++        // Top up the scratch, then CLOSE the batch only once it is full or the
++        // family is exhausted. The disk bridge's queue is shared with the
++        // on-demand spill flood, so a full 128-page batch rarely lands in one
++        // submission. Closing a short batch there cost the whole pipeline: batches
++        // averaged 37 pages (~80 batches instead of 23) and a 93K restore ran at
++        // ~700MB/s instead of the ~2.3GB/s path floor. Nothing is polled until the
++        // batch is closed, and a batch that adds nothing for several visits is
++        // closed anyway so a permanently saturated queue cannot wedge the restore.
++        const auto fill_batch = [&]() {
++            progress.batch.reserve(kL3ScratchPages);
++            while (progress.batch_pages < kL3ScratchPages && progress.page + progress.batch_pages < total) {
++                const auto index = progress.page + progress.batch_pages;
++                const auto F = std::min((index+1U)*std::uint32_t(kPagedKVPageSize), frontier);
++                const auto slot = host_kv_arena->writable_view(*scratch).subview(progress.batch_pages, 1);
++                // PRIORITY lane: this is the request path. The maintenance jobs sit
++                // in the same lane, while the ordinary queue carries the on-demand
++                // spill flood - a normal-lane read lands behind that flood and the
++                // batch shrinks to whatever the queue admits.
++                auto ticket = disk_kv->try_read_priority(identity(F), kind, {slot.data(), layout->page_stride});
++                if (!ticket) { break; }   // queue full: keep the pages already accepted
++                progress.batch.push_back(std::move(ticket));
++                ++progress.batch_pages;
++            }
++        };
++        const auto close_batch = [&]() {
++            if (progress.batch_pages == 0) { return false; }
++            if (progress.batch_pages < kL3ScratchPages && progress.page + progress.batch_pages < total
++                && progress.topup_visits < 3) {
++                return false;   // still short: top up on a later visit
++            }
++            progress.topup_visits = 0;
++            progress.batch_open = true;
++            progress.batches += 1;
++            progress.max_batch = std::max(progress.max_batch, progress.batch_pages);
++            progress.read = std::make_shared<ReadCompletion>();
++            return true;
++        };
++        if (!progress.batch_open) {
++            fill_batch();
++            if (!close_batch()) { ++progress.topup_visits; return false; }
++        }
++        // One batch per visit, deliberately. Draining several batches here was tried
++        // and measured NO gain (4591-4917ms over 27-30 batches against 4597-5277ms
++        // over 25-27 for the single-batch version): a batch's reads take ~66ms while
++        // the copy needs ~21ms, so the immediate re-poll comes back Pending and the
++        // visit ends anyway. Buying more would mean either spinning on the engine
++        // thread for the read latency or doubling the pinned scratch for a second
++        // buffer, and 300MB of the 6GiB host arena buys a large amount of session
++        // cache that this tier exists to protect. The restore is therefore bounded
++        // by the schedule cadence (~160ms per batch, ~4.6s for a 93K prompt) which
++        // still beats the 19-26s recompute by 4-5x.
++        poll_seed_batch(progress);
++        const auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
++                                         : DiskReadResult::Success;
+         if (result == DiskReadResult::Pending) { return false; }
++        if (result != DiskReadResult::Success) { progress.reason = "kv-read"; progress.batch_pages = 0; return fail(); }
++        progress.batch_destinations.clear();
++        for (std::uint32_t i = 0; i < progress.batch_pages; ++i) {
++            progress.batch_destinations.push_back(
++                pages->physical(addresses->logical_page(address, progress.page + i)));
++        }
++        // Batched H2D on the compute stream: mapping and ordered_reset precede these
++        // copies on the SAME stream. No transfer pipeline event/wait is introduced.
++        pages->physical_pool().copy_from_host(
++            host_kv_arena->view(*scratch).subview(0, progress.batch_pages),
++            std::span<const DeviceKVPageHandle>(progress.batch_destinations.data(),
++                                                progress.batch_destinations.size()),
++            device.stream);
++        CUDA_CHECK(cudaStreamSynchronize(device.stream));
++        progress.pages_read += progress.batch_pages;
++        progress.page += progress.batch_pages;
++        progress.batch_pages = 0;
++        progress.batch.clear();   // this batch's tickets must not join the next poll
++        progress.batch_open = false;
+         progress.read.reset();
+-        if (result != DiskReadResult::Success) { return fail(); }
+-        const auto destination = pages->physical(addresses->logical_page(address, progress.page));
+-        // Deliberately synchronous single-page H2D on the compute stream: mapping
+-        // and ordered_reset precede this copy on the SAME stream. No transfer
+-        // pipeline event/wait is introduced. Return to scheduling after each page.
+-        pages->physical_pool().copy_from_host(host_kv_arena->view(*scratch).subview(0,1),
+-            std::span<const DeviceKVPageHandle>(&destination,1), device.stream);
+-        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+-        ++progress.page;
++        // Immediately start the next batch's reads so the store never idles for a
++        // whole scheduling step between batches.
++        if (progress.page < total) { fill_batch(); close_batch(); }
+         return false;
+     }
+     if (progress.phase == 3) {
+@@ -3826,7 +3931,11 @@
+     staged.base = staged.cursor = staged.advertised_base = E;
+     progress.done = progress.success = true;
+     progress.state_scratch_lease.reset();
+-    fprintf(stderr, "[l3-seed-yield] lane=%u frontier=%u state=ok\n", sequence.lane,E);
++    fprintf(stderr, "[l3-seed-yield] lane=%u frontier=%u state=ok elapsed_ms=%lld pages=%u batches=%llu max_batch=%u\n",
++            sequence.lane,E,
++            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now()-progress.started).count()),
++            progress.pages_read, static_cast<unsigned long long>(progress.batches), progress.max_batch);
+     return true;
+     } catch (const std::exception& error) {
+         fprintf(stderr, "[l3-seed-yield] seed threw: %s\n", error.what());
+@@ -5541,9 +5650,13 @@
+ void ProgramImplCore::release_materialization_staging(
+     MaterializationTransaction& transaction) noexcept {
+     // Exceptional teardown is not the scheduler cancellation path. Keep the
+-    // borrowed startup allocation alive until the worker's final access.
+-    while (transaction.seed.read &&
+-           DiskKVBridge::poll(transaction.seed.read) == DiskReadResult::Pending) {
++    // borrowed startup allocation alive until the worker's final access. The KV
++    // batch's aggregate ticket only advances when poll_seed_batch() runs, so poll
++    // it here too - otherwise this loop waits forever on a batch in flight.
++    for (;;) {
++        poll_seed_batch(transaction.seed);
++        if (!transaction.seed.read ||
++            DiskKVBridge::poll(transaction.seed.read) != DiskReadResult::Pending) { break; }
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
+     if (transaction.seed_lifecycle.phase() != SeedLifecycle::Phase::Finalized) {
+@@ -7106,6 +7219,9 @@
+     if (cancellation.requested()) { transaction.cancel_pending = true; }
+     // Cancellation cannot revoke a worker's borrowed scratch. Poll before ANY
+     // abort path (including shutdown/error cleanup) can return the reservation.
++    // poll_seed_batch must run first: the KV batch's aggregate ticket is only
++    // advanced there, so a bare poll of it would never observe completion.
++    if (transaction.cancel_pending) { poll_seed_batch(transaction.seed); }
+     if (transaction.cancel_pending &&
+         !transaction.seed_lifecycle.cancel_and_drained(transaction.seed.read)) {
+         out.status = runtime::ContextTransactionStatus::InProgress;

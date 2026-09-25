@@ -1,0 +1,120 @@
+# DiskKVStore: keep the read path out of the store-wide lock
+# Baseline: the author's L3 work tree (proactive-evict), NOT upstream.
+# Series context: the full L3 disk tier lives in the ninfer-disk-kv repo;
+# these two patches are the reviewable delta measured in
+# kvcache_test/L3_STEP1_PIPELINE.md (restore 11-13s -> 4.6s for 93K tokens).
+# Changed lines: 59
+--- a/src/core/disk_kv_store.cpp
++++ b/src/core/disk_kv_store.cpp
+@@ -123,6 +123,7 @@
+         if (opts_.max_slots == 0) { throw std::invalid_argument("capacity too small"); }
+     }
+     max_slots_ = opts_.max_slots;
++    readers_.assign(max_slots_, 0);
+     slot_pitch_ = slot_bytes();
+     file_bytes_ = trailer_off() + kTrailerSize;
+ 
+@@ -242,6 +243,7 @@
+ 
+ void DiskKVStore::rebuild_from_scan() {
+     index_.clear();
++    readers_.assign(max_slots_, 0);
+     free_slots_.clear();
+     free_slots_.reserve(max_slots_);
+     clock_ = 0;
+@@ -327,6 +329,7 @@
+     bool found = false;
+     for (const auto& [id, s] : index_) {
+         if (protected_identity(id)) continue;
++        if (s < readers_.size() && readers_[s] != 0) { continue; }   // mid-read: do not recycle
+         const Header& h = *slot_hdr_c(s);
+         if (!found || h.last_used < victim_hdr->last_used ||
+             (h.last_used == victim_hdr->last_used && s < victim_slot)) {
+@@ -441,21 +444,35 @@
+ 
+ DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span<std::byte> dst) {
+     if (dst.size() != opts_.slot_size) { return DiskReadResult::BadSize; }
+-    std::lock_guard<std::mutex> lock(mu_);
+-    const auto it = index_.find(id);
+-    if (it == index_.end()) { return DiskReadResult::Missing; }
+-    const std::uint32_t slot = it->second;
+-    const Header& h = *slot_hdr_c(slot);
+-    if (h.magic != Header::kMagic) { return DiskReadResult::BadHeader; }
+-    if (!identity_matches(h, id)) { return DiskReadResult::BadIdentity; }
+-    const std::size_t off = page_off(slot);
+-    if (opts_.verify_crc) {
+-        const std::uint64_t crc = crc32c(std::span<const std::byte>(base_ + off, opts_.slot_size));
+-        if (crc != h.crc) { return DiskReadResult::BadCRC; }
+-    }
+-    std::memcpy(dst.data(), base_ + off, opts_.slot_size);
+-    (*slot_hdr(slot)).last_used = bump_clock();
+-    index_dirty_ = true;
++    std::size_t off = 0;
++    std::uint32_t slot = 0;
++    std::uint64_t expected_crc = 0;
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        const auto it = index_.find(id);
++        if (it == index_.end()) { return DiskReadResult::Missing; }
++        slot = it->second;
++        if (slot >= readers_.size()) { return DiskReadResult::BadHeader; }
++        const Header& h = *slot_hdr_c(slot);
++        if (h.magic != Header::kMagic) { return DiskReadResult::BadHeader; }
++        if (!identity_matches(h, id)) { return DiskReadResult::BadIdentity; }
++        expected_crc = h.crc;
++        off = page_off(slot);
++        ++readers_[slot];                    // pin: eviction must not recycle it
++        (*slot_hdr(slot)).last_used = bump_clock();
++        index_dirty_ = true;
++    }
++    // Payload validation and copy happen OUTSIDE the store lock so concurrent
++    // readers actually run in parallel (see readers_ in the header).
++    const bool crc_ok = !opts_.verify_crc ||
++        crc32c(std::span<const std::byte>(base_ + off, opts_.slot_size)) == expected_crc;
++    if (crc_ok) { std::memcpy(dst.data(), base_ + off, opts_.slot_size); }
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        auto& pinned = readers_[slot];
++        if (pinned) { --pinned; }
++    }
++    if (!crc_ok) { return DiskReadResult::BadCRC; }
+     return DiskReadResult::Success;
+ }
+ 
+@@ -484,6 +501,7 @@
+     const auto it = index_.find(id);
+     if (it == index_.end()) { return false; }
+     const std::uint32_t slot = it->second;
++    if (slot < readers_.size() && readers_[slot] != 0) { return false; }   // mid-read
+     index_.erase(it);
+     zero_slot(slot);
+     release_slot(slot);
+--- a/src/core/disk_kv_store.h
++++ b/src/core/disk_kv_store.h
+@@ -219,6 +219,12 @@
+     bool         index_dirty_ = false; // protected by mu_ after construction
+ 
+     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
++    // Per-slot in-flight READ count (protected by mu_). Read payloads are
++    // CRC-checked and copied OUTSIDE mu_: holding the lock across 1.18MB of
++    // CRC+memcpy serialized every reader at ~1.2 ms/page (~980MB/s), while the
++    // same NVMe sustains ~880MB/s with only four concurrent streams. A pinned
++    // slot must not be recycled under a copy, so eviction skips readers_ != 0.
++    std::vector<std::uint32_t> readers_;
+     std::vector<std::uint32_t> free_slots_;
+ };
+ 
+--- a/src/core/disk_kv_bridge.h
++++ b/src/core/disk_kv_bridge.h
+@@ -292,7 +292,10 @@
+     // pages concurrently; the SSD needs several in-flight streams to reach its
+     // bandwidth (single-writer was ~180 MB/s of a ~2 GB/s device through the
+     // bind-mount layer). Bookkeeping stays serialized by the store lock.
+-    static constexpr std::size_t kWorkerCount = 3;
++    // Three workers could not keep the NVMe busy even when every reader held the
++    // store lock only briefly: four concurrent streams already reach ~880MB/s on
++    // this volume against 421MB/s single-stream. Reads and writes share these.
++    static constexpr std::size_t kWorkerCount = 8;
+ };
+ 
+ } // namespace ninfer
