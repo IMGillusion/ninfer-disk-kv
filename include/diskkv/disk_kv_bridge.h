@@ -55,9 +55,19 @@ enum class DiskKVKind : std::uint8_t {
  *  worker thread does the disk write (off the engine's hot path). */
 // Completion acknowledges upsert/readability, NOT durable index publication.
 // Probe runs on the writer too, so dedupe never waits for the store lock on the engine.
-enum class SpillStatus : std::uint8_t { Pending, Present, Missing, Written, Failed };
+enum class SpillStatus : std::uint8_t { Pending, Present, Missing, Written, Dropped, Failed };
 struct SpillCompletion { std::atomic<SpillStatus> status{SpillStatus::Pending}; };
 using SpillTicket = std::shared_ptr<SpillCompletion>;
+
+// One bounded batch consumes ONE queue slot and ONE scheduler completion.
+inline constexpr std::size_t kDiskKVProbeBatchMax = 32;
+struct ProbeBatchCompletion {
+    // Read results only after poll(ticket) returns true (acquire publication).
+    std::array<SpillStatus, kDiskKVProbeBatchMax> results{};
+    std::size_t size = 0;
+    std::atomic<bool> ready{false};
+};
+using ProbeBatchTicket = std::shared_ptr<ProbeBatchCompletion>;
 
 struct SpillJob {
     DiskKVIdentity id;
@@ -66,7 +76,20 @@ struct SpillJob {
     SpillTicket completion;
     std::span<const std::byte> borrowed;
     bool probe = false;
+    std::vector<DiskKVIdentity> probe_ids;
+    ProbeBatchTicket probe_batch;
+    std::shared_ptr<struct ReadCompletion> read;
+    std::span<std::byte> read_dst;
+    // Maintenance work (proactive preparation) must not queue behind a flood of
+    // on-demand spills: without this the preparation waited ~1.7s per page and
+    // never finished, which is exactly the blocking this path exists to remove.
+    bool priority = false;
 };
+
+struct ReadCompletion {
+    std::atomic<DiskReadResult> result{DiskReadResult::Pending};
+};
+using ReadTicket = std::shared_ptr<ReadCompletion>;
 
 struct DiskKVBridgeStats {
     std::uint64_t spills          = 0;
@@ -100,6 +123,24 @@ public:
 
     [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
+    struct ClosureLease {
+        std::array<DiskKVStore*, 3> stores{};
+        ~ClosureLease() { for (auto* store : stores) if (store) store->unprotect(); }
+    };
+    std::unique_ptr<ClosureLease> try_protect_closure(
+        const std::array<std::vector<DiskKVIdentity>, 3>& ids) {
+        auto lease = std::make_unique<ClosureLease>();
+        for (unsigned i = 0; i < 3; ++i) {
+            if (ids[i].empty()) continue;
+            auto* store = family(static_cast<DiskKVKind>(i)).store.get();
+            if (!store || ids[i].size() > store->slot_count()) return {};
+            auto keys = std::make_shared<const DiskKVStore::ProtectedKeys>(ids[i].begin(), ids[i].end());
+            if (!store->try_protect(std::move(keys))) return {};
+            lease->stores[i] = store;
+        }
+        return lease;
+    }
+
     /** Spill one page. The bytes are copied into a bounded queue and written
      *  by a background thread: the caller only pays one memcpy (host pages
      *  are released by the engine right after this call, so synchronous disk
@@ -128,13 +169,43 @@ public:
     // Borrowed bytes MUST remain immutable/alive until poll != Pending,
     // including cancellation. Worker never accesses SequenceState.
     SpillTicket try_probe(const DiskKVIdentity& id, DiskKVKind kind);
+    /** Nonblocking queue admission; one homogeneous batch, 1..32 identities.
+     *  Identities are COPIED before return; no borrowed owner/page memory.
+     *  Null = busy/shutdown: retry the ENTIRE unchanged batch, no drops counted.
+     *  Empty/oversized input throws invalid_argument; allocation may throw.
+     *  Disabled bridge/family or invalid kind completes every page as Failed.
+     *  Results preserve input order (including duplicates); read only after
+     *  poll returns true. Present is a contains() snapshot, not a CRC check,
+     *  reservation, cross-page atomic snapshot, or durable-write guarantee.
+     *  Tickets can outlive bridge destruction, which drains accepted work.
+     *  Dropping a ticket does not cancel work; caller must not mutate results.
+     *  Like all bridge methods, submission must not race bridge destruction. */
+    ProbeBatchTicket try_probe_batch(std::span<const DiskKVIdentity> ids, DiskKVKind kind);
+    static bool poll(const ProbeBatchTicket& ticket) noexcept {
+        return ticket->ready.load(std::memory_order_acquire);
+    }
     SpillTicket try_submit(const DiskKVIdentity& id, DiskKVKind kind,
                            std::span<const std::byte> bytes);
+    // Busy preserves bytes; accepted jobs own their payload through completion.
+    SpillTicket try_submit_owned(const DiskKVIdentity& id, DiskKVKind kind,
+                                 std::vector<std::byte>& bytes);
+    // Maintenance lane: same ownership contract, but workers drain it first.
+    SpillTicket try_submit_owned_priority(const DiskKVIdentity& id, DiskKVKind kind,
+                                          std::vector<std::byte>& bytes);
     static SpillStatus poll(const SpillTicket& ticket) noexcept {
         return ticket->status.load(std::memory_order_acquire);
     }
 
-    /** Wait until all queued spill jobs have been applied. Test/diagnostics. */
+    /** Wait until queued jobs and their threshold/idle index flushes finish.
+     *  Test/diagnostics; tickets alone only acknowledge readable data. */
+    // CPU-only worker borrows dst until acquire-poll is terminal. Cancellation
+    // does NOT revoke the borrow. Null = busy; no store lock on submission.
+    ReadTicket try_read(const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst);
+    // Maintenance lane for the read-back that validates a prepared closure.
+    ReadTicket try_read_priority(const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst);
+    static DiskReadResult poll(const ReadTicket& ticket) noexcept {
+        return ticket->result.load(std::memory_order_acquire);
+    }
     void wait_idle();
 
     /** Read one previously spilt page into `dst` (family stride bytes).
@@ -204,11 +275,15 @@ private:
     // identity + CRC) and the store rebuilds a missing index by scanning them,
     // so an atomic index rewrite per page is pure overhead (a crash loses at
     // most the last batch — the scan recovers the durable slots).
+    // Guarded by qmu_: all three workers increment/claim batches. Reset BEFORE
+    // flushing outside qmu_; in_flight_ covers that I/O through completion.
     std::uint32_t flush_pending_ = 0;
     // Bounded async spill queue + writer thread.
     std::mutex qmu_;
     std::condition_variable qcv_;
     std::deque<SpillJob> queue_;
+    // Maintenance lane drained before the general queue; same capacity budget.
+    std::deque<SpillJob> priority_queue_;
     std::vector<std::thread> workers_;
     bool quit_ = false;
     std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied
@@ -217,7 +292,10 @@ private:
     // pages concurrently; the SSD needs several in-flight streams to reach its
     // bandwidth (single-writer was ~180 MB/s of a ~2 GB/s device through the
     // bind-mount layer). Bookkeeping stays serialized by the store lock.
-    static constexpr std::size_t kWorkerCount = 3;
+    // Three workers could not keep the NVMe busy even when every reader held the
+    // store lock only briefly: four concurrent streams already reach ~880MB/s on
+    // this volume against 421MB/s single-stream. Reads and writes share these.
+    static constexpr std::size_t kWorkerCount = 8;
 };
 
 } // namespace ninfer

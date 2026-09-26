@@ -28,12 +28,17 @@
 // Self-contained (no CUDA, no engine types): builds and unit-tests in seconds.
 
 #include <cstddef>
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <map>
+#include <unordered_set>
 #include <vector>
 
 namespace ninfer {
@@ -60,6 +65,8 @@ struct DiskKVIdentityHash {
         return static_cast<std::size_t>(h);
     }
 };
+
+enum class DiskReadResult { Pending, Success, Missing, BadHeader, BadIdentity, BadCRC, BadSize, IOFailure, Disabled };
 
 class DiskKVStore {
 public:
@@ -101,6 +108,7 @@ public:
     /** Read the page into `dst` (slot_size bytes). Identity + CRC verified;
      *  refreshes the LRU timestamp. */
     bool read_page(const DiskKVIdentity& id, std::span<std::byte> dst);
+    DiskReadResult read_page_result(const DiskKVIdentity& id, std::span<std::byte> dst);
 
     /** Presence check (cheap; no data read, no LRU refresh). */
     [[nodiscard]] bool contains(const DiskKVIdentity& id) const;
@@ -125,6 +133,14 @@ public:
     /** Publish pending LRU/index changes (batch/idle/shutdown barrier).
      *  Atomic replacement, NOT an fsync/power-loss durability barrier. */
     void flush_index();
+
+    using ProtectedKeys = std::unordered_set<DiskKVIdentity, DiskKVIdentityHash>;
+    // Nonblocking, single maintenance lease. It protects future writes too.
+    bool try_protect(std::shared_ptr<const ProtectedKeys> keys) noexcept {
+        std::shared_ptr<const ProtectedKeys> empty;
+        return std::atomic_compare_exchange_strong(&protected_keys_, &empty, std::move(keys));
+    }
+    void unprotect() noexcept { std::atomic_store(&protected_keys_, std::shared_ptr<const ProtectedKeys>{}); }
 
     static constexpr std::size_t kSlotHeaderSize = 48;
     static std::uint64_t crc32c(std::span<const std::byte> data);
@@ -179,6 +195,8 @@ private:
     std::uint64_t bump_clock() noexcept;
     void zero_slot(std::uint32_t slot);
     void record_live(const DiskKVIdentity& id, std::uint32_t slot, std::uint64_t last_used);
+    void lru_insert(std::uint32_t slot, std::uint64_t last_used);
+    void lru_erase(std::uint32_t slot) noexcept;
     void release_slot(std::uint32_t slot);
     struct EvictedPage {
         DiskKVIdentity id;
@@ -188,6 +206,25 @@ private:
     std::optional<EvictedPage> evict_one_lru();
 
     mutable std::mutex mu_;
+    std::shared_ptr<const ProtectedKeys> protected_keys_;
+    // O(log n) LRU index (last_used -> slot) plus slot->iterator. Replaces
+    // evict_one_lru's O(n) full-index scan, which touched every slot's mmap
+    // header page (~26K faults per scan on a store larger than VM memory)
+    // while holding mu_ for minutes once the store was full.
+    std::map<std::uint64_t, std::uint32_t> lru_;
+    std::unordered_map<std::uint32_t, std::map<std::uint64_t, std::uint32_t>::iterator> lru_slot_;
+    // Short-TTL cache of live_identities(): the admission probe calls it
+    // thousands of times per second while a transaction stalls, and the full
+    // index copy under mu_ starved the bridge workers' mu2 sections
+    // (observed: 11 upserts never returned from mu2). 250ms staleness is fine
+    // for candidate selection because the actual reads verify the pages.
+    mutable std::vector<DiskKVIdentity> live_cache_;
+    mutable std::chrono::steady_clock::time_point live_cache_at_{};
+    bool protected_identity(const DiskKVIdentity& id) const noexcept {
+        auto keys = std::atomic_load(&protected_keys_);
+        if (!keys) return false;
+        return keys->contains(id);
+    }
     Options      opts_;
     int          fd_         = -1;
     std::byte*   base_       = nullptr;
@@ -199,6 +236,12 @@ private:
     bool         index_dirty_ = false; // protected by mu_ after construction
 
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
+    // Per-slot in-flight READ count (protected by mu_). Read payloads are
+    // CRC-checked and copied OUTSIDE mu_: holding the lock across 1.18MB of
+    // CRC+memcpy serialized every reader at ~1.2 ms/page (~980MB/s), while the
+    // same NVMe sustains ~880MB/s with only four concurrent streams. A pinned
+    // slot must not be recycled under a copy, so eviction skips readers_ != 0.
+    std::vector<std::uint32_t> readers_;
     std::vector<std::uint32_t> free_slots_;
 };
 
